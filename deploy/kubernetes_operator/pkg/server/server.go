@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/golang/protobuf/ptypes/empty"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog"
 
@@ -31,6 +33,14 @@ import (
 
 type PairHandler struct {
 	handler operator.AppEventHandler
+}
+
+func (ph *PairHandler) Ping(_ context.Context, _ *empty.Empty) (*pb.Status, error) {
+	klog.Infof("Ping received")
+	return &pb.Status{
+		Code:         int32(codes.OK),
+		ErrorMessage: "Pong",
+	}, nil
 }
 
 func (ph *PairHandler) Register(ctx context.Context, request *pb.RegisterRequest) (*pb.Status, error) {
@@ -55,6 +65,7 @@ func (ph *PairHandler) Register(ctx context.Context, request *pb.RegisterRequest
 
 func (ph *PairHandler) Pair(ctx context.Context, request *pb.PairRequest) (*pb.Status, error) {
 	name := request.AppId
+	klog.Infof("Pair received, name = %v, pairs = %v", name, request.Pairs)
 
 	leaderReplicas := make(map[string][]string)
 	followerReplicas := make(map[string][]string)
@@ -95,6 +106,7 @@ func ServeGrpc(host, port string, handler operator.AppEventHandler) {
 	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterPairingServiceServer(grpcServer, &PairHandler{handler: handler})
+	reflection.Register(grpcServer)
 	if err := grpcServer.Serve(lis); err != nil {
 		klog.Fatalf("failed to serve grpc service, err = %v", err)
 	}

@@ -17,6 +17,8 @@
 set -ex
 
 export CUDA_VISIBLE_DEVICES=
+export MODEL_NAME=${APPLICATION_ID}
+
 source /app/deploy/scripts/hdfs_common.sh || true
 source /app/deploy/scripts/env_to_args.sh
 
@@ -41,23 +43,30 @@ for i in "${WORKER_GROUPS[@]}"; do
 done
 fi
 
-tensorboard --logdir "$OUTPUT_BASE_DIR/tensorboard" --port 6006 &
 if [[ ${CODE_KEY} == "hdfs://"* ]]; then
     ${HADOOP_HOME}/bin/hadoop fs -copyToLocal ${CODE_KEY} code.tar.gz
 elif [[ ${CODE_KEY} == "http://"* || ${CODE_KEY} == "https://"* ]]; then
     wget ${CODE_KEY} -O code.tar.gz
+elif [[ ${CODE_KEY} == "oss://"* ]]; then
+    python -c "import tensorflow as tf; import tensorflow_io; open('code.tar.gz', 'wb').write(tf.io.gfile.GFile('${CODE_KEY}', 'rb').read())"
 else
     cp ${CODE_KEY} code.tar.gz
 fi
 tar -zxvf code.tar.gz
 cd ${ROLE}
 
+verbosity=$(normalize_env_to_args "--verbosity" "$VERBOSITY")
 save_checkpoint_steps=$(normalize_env_to_args "--save-checkpoint-steps" "$SAVE_CHECKPOINT_STEPS")
+save_checkpoint_secs=$(normalize_env_to_args "--save-checkpoint-secs" "$SAVE_CHECKPOINT_SECS")
 sparse_estimator=$(normalize_env_to_args "--sparse-estimator" "$SPARSE_ESTIMATOR")
 summary_save_steps=$(normalize_env_to_args "--summary-save-steps" "$SUMMARY_SAVE_STEPS")
+batch_size=$(normalize_env_to_args "--batch-size" "$BATCH_SIZE")
+learning_rate=$(normalize_env_to_args "--learning-rate" "$LEARNING_RATE")
+
 
 python main.py \
     --data-path="$DATA_PATH" \
+    --application-id="$APPLICATION_ID" \
     --cluster-spec="$CLUSTER_SPEC" \
     --tf-addr="$POD_IP:50052" \
     --local-addr="$POD_IP:50051" \
@@ -65,5 +74,6 @@ python main.py \
     --peer-addr="$PEER_ADDR" \
     --checkpoint-path="$OUTPUT_BASE_DIR/checkpoints" \
     --export-path="$OUTPUT_BASE_DIR/exported_models" \
-    --summary-path="$OUTPUT_BASE_DIR/tensorboard" \
-    $save_checkpoint_steps $sparse_estimator $summary_save_steps
+    $verbosity \
+    $save_checkpoint_steps $sparse_estimator $summary_save_steps \
+    $save_checkpoint_secs $batch_size $learning_rate

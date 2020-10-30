@@ -22,7 +22,6 @@ source /app/deploy/scripts/env_to_args.sh
 
 MASTER_POD_NAMES=`python -c 'import json, os; print(json.loads(os.environ["CLUSTER_SPEC"])["clusterSpec"]["Master"][0])'`
 
-merge_buffer_size=$(normalize_env_to_args "--merge_buffer_size" $MERGE_BUFFER_SIZE)
 merger_read_ahead_size=$(normalize_env_to_args "--merger_read_ahead_size" $MERGE_READ_AHEAD_SIZE)
 merger_read_batch_size=$(normalize_env_to_args "--merger_read_batch_size" $MERGE_READ_BATCH_SIZE)
 input_data_file_iter=$(normalize_env_to_args "--input_data_file_iter" $INPUT_DATA_FORMAT)
@@ -32,17 +31,12 @@ read_batch_size=$(normalize_env_to_args "--read_batch_size" $READ_BATCH_SIZE)
 output_builder=$(normalize_env_to_args "--output_builder" $OUTPUT_DATA_FORMAT)
 builder_compressed_type=$(normalize_env_to_args "--builder_compressed_type" $BUILDER_COMPRESSED_TYPE)
 batch_size=$(normalize_env_to_args "--batch_size" $BATCH_SIZE)
-max_flying_item=$(normalize_env_to_args "--max_flying_item" $MAX_FLYING_ITEM)
-
+kvstore_type=$(normalize_env_to_args '--kvstore_type' $KVSTORE_TYPE)
 
 python -m fedlearner.data_join.cmd.data_portal_worker_cli \
   --rank_id=$INDEX \
   --master_addr=$MASTER_POD_NAMES \
-  --etcd_name=$ETCD_NAME \
-  --etcd_addrs=$ETCD_ADDR \
-  --etcd_base_dir=$ETCD_BASE_DIR \
-  $merge_buffer_size \
   $input_data_file_iter $compressed_type $read_ahead_size $read_batch_size \
   $output_builder $builder_compressed_type \
-  $batch_size $max_flying_item $USE_MOCK_ETCD
+  $batch_size $kvstore_type
 

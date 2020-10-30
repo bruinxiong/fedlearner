@@ -17,7 +17,11 @@
 import threading
 import logging
 import os
+import time
+import traceback
 from contextlib import contextmanager
+
+from fedlearner.common import metrics
 
 from fedlearner.data_join.raw_data_visitor import RawDataVisitor
 from fedlearner.data_join.data_block_manager import \
@@ -25,7 +29,7 @@ from fedlearner.data_join.data_block_manager import \
 from fedlearner.data_join import common
 
 class DataBlockDumperManager(object):
-    def __init__(self, etcd, data_source, partition_id,
+    def __init__(self, kvstore, data_source, partition_id,
                  raw_data_options, data_block_builder_options):
         self._lock = threading.Lock()
         self._data_source = data_source
@@ -33,7 +37,7 @@ class DataBlockDumperManager(object):
         self._data_block_manager = \
                 DataBlockManager(data_source, partition_id)
         self._raw_data_visitor = \
-                RawDataVisitor(etcd, data_source,
+                RawDataVisitor(kvstore, data_source,
                                partition_id, raw_data_options)
         self._data_block_builder_options = data_block_builder_options
         self._next_data_block_index = \
@@ -41,6 +45,9 @@ class DataBlockDumperManager(object):
         self._fly_data_block_meta = []
         self._state_stale = False
         self._synced_data_block_meta_finished = False
+        ds_name = self._data_source.data_source_meta.name
+        self._metrics_tags = {'data_source_name': ds_name,
+                              'partiton': self._partition_id}
 
     def get_next_data_block_index(self):
         with self._lock:
@@ -85,8 +92,13 @@ class DataBlockDumperManager(object):
         while self.need_dump():
             meta = self._get_next_data_block_meta()
             if meta is not None:
+                start_tm = time.time()
                 self._raw_data_visitor.active_visitor()
                 self._dump_data_block_by_meta(meta)
+                dump_duration = time.time() - start_tm
+                metrics.emit_timer(name='data_block_dump_duration',
+                                   value=int(dump_duration),
+                                   tags=self._metrics_tags)
 
     def data_block_meta_sync_finished(self):
         with self._lock:
@@ -146,6 +158,7 @@ class DataBlockDumperManager(object):
             except StopIteration:
                 logging.fatal("raw data finished before when seek to %d",
                               meta.leader_start_index-1)
+                traceback.print_stack()
                 os._exit(-1) # pylint: disable=protected-access
             match_index = 0
             example_num = len(meta.example_ids)
@@ -164,8 +177,9 @@ class DataBlockDumperManager(object):
                         "for data block %s",
                         match_index, example_num, meta.block_id
                     )
+                traceback.print_stack()
                 os._exit(-1) # pylint: disable=protected-access
-            dumped_meta = data_block_builder.finish_data_block()
+            dumped_meta = data_block_builder.finish_data_block(True)
             assert dumped_meta == meta, "the generated dumped meta shoud "\
                                         "be the same with input mata"
             with self._lock:

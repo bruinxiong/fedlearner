@@ -20,25 +20,21 @@ import logging
 from fedlearner.common import data_join_service_pb2 as dj_pb
 from fedlearner.common import data_portal_service_pb2 as dp_pb
 from fedlearner.data_join.data_portal_worker import DataPortalWorker
+from fedlearner.data_join.common import get_kvstore_config
 
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)
-    logging.basicConfig(format='%(asctime)s %(message)s')
+    logging.basicConfig(format="%(asctime)s %(filename)s "\
+                               "%(lineno)s %(levelname)s - %(message)s")
     parser = argparse.ArgumentParser(description='DataJointPortal cmd.')
     parser.add_argument("--rank_id", type=int,
                         help="the rank id of this worker")
     parser.add_argument("--master_addr", type=str,
                         help="the addr of data portal master")
-    parser.add_argument("--etcd_name", type=str,
-                        default='test_etcd', help='the name of etcd')
-    parser.add_argument("--etcd_addrs", type=str,
-                        default="localhost:2379", help="the addrs of etcd")
-    parser.add_argument("--etcd_base_dir", type=str,
-                        help="the namespace of etcd key for data portal worker")
+    parser.add_argument("--kvstore_type", type=str,
+                        default='etcd', help='the type of kvstore')
     parser.add_argument("--use_mock_etcd", action="store_true",
-                        help='use to mock etcd for test')
-    parser.add_argument("--merge_buffer_size", type=int,
-                        default=4096, help="the buffer size for merging")
+                        help='use to mock mysql for test')
     parser.add_argument("--merger_read_ahead_size", type=int, default=128<<10,
                         help="the read ahead size for merger")
     parser.add_argument("--merger_read_batch_size", type=int, default=32,
@@ -61,8 +57,6 @@ if __name__ == '__main__':
                         help='the builder for ouput file')
     parser.add_argument("--batch_size", type=int, default=1024,
                         help="the batch size for raw data reader")
-    parser.add_argument("--max_flying_item", type=int, default=1048576,
-                        help='the maximum items processed at the same time')
     args = parser.parse_args()
     if args.input_data_file_iter == 'TF_RECORD' or \
             args.output_builder == 'TF_RECORD':
@@ -82,16 +76,17 @@ if __name__ == '__main__':
         ),
         batch_processor_options=dj_pb.BatchProcessorOptions(
             batch_size=args.batch_size,
-            max_flying_item=args.max_flying_item
+            max_flying_item=-1
         ),
-        merge_buffer_size=args.merge_buffer_size,
         merger_read_ahead_size=args.merger_read_ahead_size,
         merger_read_batch_size=args.merger_read_batch_size
     )
-
+    db_database, db_addr, db_username, db_password, db_base_dir = \
+        get_kvstore_config(args.kvstore_type)
     data_portal_worker = DataPortalWorker(
             portal_worker_options, args.master_addr,
-            args.rank_id, args.etcd_name, args.etcd_base_dir,
-            args.etcd_addrs, args.use_mock_etcd
+            args.rank_id, db_database, db_base_dir,
+            db_addr, db_username, db_password,
+            (args.kvstore_type == 'mock')
         )
     data_portal_worker.start()

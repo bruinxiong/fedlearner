@@ -20,11 +20,16 @@ import uuid
 import threading
 import time
 from contextlib import contextmanager
+from collections import OrderedDict
+
 from guppy import hpy
 
+import tensorflow_io # pylint: disable=unused-import
 import tensorflow.compat.v1 as tf
 from google.protobuf import text_format
 from tensorflow.compat.v1 import gfile
+
+import psutil
 
 from fedlearner.common import common_pb2 as common_pb
 from fedlearner.common import data_join_service_pb2 as dj_pb
@@ -38,6 +43,7 @@ TmpFileSuffix = '.tmp'
 DoneFileSuffix = '.done'
 RawDataFileSuffix = '.rd'
 InvalidEventTime = -9223372036854775808
+InvalidRawId = ''.encode()
 
 @contextmanager
 def make_tf_record_iter(fpath, options=None):
@@ -101,42 +107,43 @@ def load_data_block_meta(meta_fpath):
     with make_tf_record_iter(meta_fpath) as fitr:
         return text_format.Parse(next(fitr).decode(), dj_pb.DataBlockMeta())
 
-def data_source_etcd_base_dir(data_source_name):
+def data_source_kvstore_base_dir(data_source_name):
     return os.path.join('data_source', data_source_name)
 
-def retrieve_data_source(etcd, data_source_name):
-    etcd_key = data_source_etcd_base_dir(data_source_name)
-    raw_data = etcd.get_data(etcd_key)
+def retrieve_data_source(kvstore, data_source_name):
+    kvstore_key = data_source_kvstore_base_dir(data_source_name)
+    raw_data = kvstore.get_data(kvstore_key)
     if raw_data is None:
-        raise ValueError("etcd master key is None for {}".format(
+        raise ValueError("kvstore master key is None for {}".format(
             data_source_name)
         )
     return text_format.Parse(raw_data, common_pb.DataSource())
 
-def commit_data_source(etcd, data_source):
-    etcd_key = data_source_etcd_base_dir(data_source.data_source_meta.name)
-    etcd.set_data(etcd_key, text_format.MessageToString(data_source))
+def commit_data_source(kvstore, data_source):
+    kvstore_key = \
+        data_source_kvstore_base_dir(data_source.data_source_meta.name)
+    kvstore.set_data(kvstore_key, text_format.MessageToString(data_source))
 
-def partition_manifest_etcd_key(data_source_name, partition_id):
-    return os.path.join(data_source_etcd_base_dir(data_source_name),
+def partition_manifest_kvstore_key(data_source_name, partition_id):
+    return os.path.join(data_source_kvstore_base_dir(data_source_name),
                         'raw_data_dir', partition_repr(partition_id))
 
-def raw_data_meta_etcd_key(data_source_name, partition_id, process_index):
-    manifest_etcd_key = partition_manifest_etcd_key(data_source_name,
+def raw_data_meta_kvstore_key(data_source_name, partition_id, process_index):
+    manifest_kvstore_key = partition_manifest_kvstore_key(data_source_name,
                                                     partition_id)
-    return os.path.join(manifest_etcd_key,
+    return os.path.join(manifest_kvstore_key,
                         '{}{:08}'.format(RawDataMetaPrefix, process_index))
 
-def example_id_anchor_etcd_key(data_source_name, partition_id):
-    etcd_base_dir = data_source_etcd_base_dir(data_source_name)
-    return os.path.join(etcd_base_dir, 'dumped_example_id_anchor',
+def example_id_anchor_kvstore_key(data_source_name, partition_id):
+    db_base_dir = data_source_kvstore_base_dir(data_source_name)
+    return os.path.join(db_base_dir, 'dumped_example_id_anchor',
                         partition_repr(partition_id))
 
-def raw_data_pub_etcd_key(pub_base_dir, partition_id, process_index):
+def raw_data_pub_kvstore_key(pub_base_dir, partition_id, process_index):
     return os.path.join(pub_base_dir, partition_repr(partition_id),
                         '{:08}{}'.format(process_index, RawDataPubSuffix))
 
-_valid_basic_feature_type = (int, str, bytes, float)
+_valid_basic_feature_type = (int, str, float)
 def convert_dict_to_tf_example(src_dict):
     assert isinstance(src_dict, dict)
     tf_feature = {}
@@ -145,7 +152,7 @@ def convert_dict_to_tf_example(src_dict):
             raise RuntimeError('the key {}({}) of dict must a '\
                                'string'.format(key, type(key)))
         basic_type = type(feature)
-        if basic_type == str and key != 'example_id':
+        if basic_type == str and key not in ('example_id', 'raw_id'):
             if feature.lstrip('-').isdigit():
                 feature = int(feature)
                 basic_type = int
@@ -170,10 +177,6 @@ def convert_dict_to_tf_example(src_dict):
             value = feature if isinstance(feature, list) else [feature]
             tf_feature[key] = tf.train.Feature(
                 int64_list=tf.train.Int64List(value=value))
-        elif basic_type == bytes:
-            value = feature if isinstance(feature, list) else [feature]
-            tf_feature[key] = tf.train.Feature(
-                bytes_list=tf.train.BytesList(value=value))
         elif basic_type == str:
             value = [feat.encode() for feat in feature] if \
                      isinstance(feature, list) else [feature.encode()]
@@ -188,10 +191,20 @@ def convert_dict_to_tf_example(src_dict):
 
 def convert_tf_example_to_dict(src_tf_example):
     assert isinstance(src_tf_example, tf.train.Example)
-    dst_dict = {}
+    dst_dict = OrderedDict()
     tf_feature = src_tf_example.features.feature
-    for key, feat in tf_feature:
-        dst_dict[key] = feat
+    for key, feat in tf_feature.items():
+        csv_val = None
+        if feat.HasField('int64_list'):
+            csv_val = [item for item in feat.int64_list.value] # pylint: disable=unnecessary-comprehension
+        elif feat.HasField('bytes_list'):
+            csv_val = [item.decode() for item in feat.bytes_list.value] # pylint: disable=unnecessary-comprehension
+        elif feat.HasField('float_list'):
+            csv_val = [item for item in feat.float_list.value] #pylint: disable=unnecessary-comprehension
+        else:
+            assert False, "feat type must in int64, byte, float"
+        assert isinstance(csv_val, list)
+        dst_dict[key] = csv_val[0] if len(csv_val) == 1 else csv_val
     return dst_dict
 
 def int2bytes(digit, byte_len, byteorder='little'):
@@ -203,15 +216,15 @@ def bytes2int(byte, byteorder='little'):
 def gen_tmp_fpath(fdir):
     return os.path.join(fdir, str(uuid.uuid1())+TmpFileSuffix)
 
-def portal_etcd_base_dir(portal_name):
+def portal_kvstore_base_dir(portal_name):
     return os.path.join('portal', portal_name)
 
-def portal_job_etcd_key(portal_name, job_id):
-    return os.path.join(portal_etcd_base_dir(portal_name), 'job_dir',
+def portal_job_kvstore_key(portal_name, job_id):
+    return os.path.join(portal_kvstore_base_dir(portal_name), 'job_dir',
                         '{:08}.pj'.format(job_id))
 
-def portal_job_part_etcd_key(portal_name, job_id, partition_id):
-    return os.path.join(portal_job_etcd_key(portal_name, job_id),
+def portal_job_part_kvstore_key(portal_name, job_id, partition_id):
+    return os.path.join(portal_job_kvstore_key(portal_name, job_id),
                         partition_repr(partition_id))
 
 def portal_map_output_dir(map_base_dir, job_id):
@@ -226,29 +239,135 @@ def data_source_data_block_dir(data_source):
 def data_source_example_dumped_dir(data_source):
     return os.path.join(data_source.output_base_dir, 'example_dump')
 
-class _OomRsikChecker(object):
+class Singleton(type):
+    _instances = {}
+    _lck = threading.Lock()
+    def __call__(cls, *args, **kwargs):
+        with cls._lck:
+            if cls not in cls._instances:
+                cls._instances[cls] = super(Singleton, cls).__call__(*args,
+                                                                     **kwargs)
+            return cls._instances[cls]
+
+class _MemUsageProxy(object, metaclass=Singleton):
     def __init__(self):
         self._lock = threading.Lock()
         self._mem_limit = int(os.environ.get('MEM_LIMIT', '17179869184'))
-        self._latest_updated_ts = 0
-        self._heap_memory_usage = None
-        self._try_update_memory_usage(True)
+        self._reserved_mem = int(self._mem_limit * 0.5)
+        if self._reserved_mem >= 2 << 30:
+            self._reserved_mem = 2 << 30
+        self._rss_mem_usage = 0
+        self._rss_updated_tm = 0
 
-
-    def _try_update_memory_usage(self, force):
-        if time.time() - self._latest_updated_ts >= 1 or force:
-            self._heap_memory_usage = hpy().heap().size
-            self._latest_updated_ts = time.time()
-
-    def check_oom_risk(self, water_level_percent=0.9, force=False):
+    def check_heap_mem_water_level(self, heap_mem_usage, water_level_percent):
         with self._lock:
-            self._try_update_memory_usage(force)
-            reserved_mem = int(self._mem_limit * 0.5)
-            if reserved_mem >= int((1 << 30) * 1.5):
-                reserved_mem = int((1 << 30) * 1.5)
-            avail_mem = self._mem_limit - reserved_mem
-            return self._heap_memory_usage >= avail_mem * water_level_percent
+            avail_mem = self._mem_limit - self._reserved_mem
+            return heap_mem_usage >= avail_mem * water_level_percent
 
-_oom_risk_checker = _OomRsikChecker()
-def get_oom_risk_checker():
-    return _oom_risk_checker
+    def check_rss_mem_water_level(self, water_level_percent):
+        avail_mem = self._mem_limit - self._reserved_mem
+        return self._update_rss_mem_usage() >= avail_mem * water_level_percent
+
+    def get_heap_mem_usage(self):
+        return hpy().heap().size
+
+    def _update_rss_mem_usage(self):
+        with self._lock:
+            if time.time() - self._rss_updated_tm >= 0.25:
+                self._rss_mem_usage = psutil.Process().memory_info().rss
+                self._rss_updated_tm = time.time()
+            return self._rss_mem_usage
+
+def _get_mem_usage_proxy():
+    return _MemUsageProxy()
+
+class _HeapMemStats(object, metaclass=Singleton):
+    class StatsRecord(object):
+        def __init__(self, potential_mem_incr, stats_expiration_time):
+            self._lock = threading.Lock()
+            self._potential_mem_incr = potential_mem_incr
+            self._stats_expiration_time = stats_expiration_time
+            self._stats_ts = 0
+            self._heap_mem_usage = 0
+
+        def stats_expiration(self):
+            return self._stats_ts <= 0 or \
+                    (self._stats_expiration_time is not None and
+                        time.time() - self._stats_ts >= \
+                                self._stats_expiration_time)
+
+        def update_stats(self):
+            with self._lock:
+                if self.stats_expiration():
+                    self._heap_mem_usage = \
+                        _get_mem_usage_proxy().get_heap_mem_usage()
+                    self._stats_ts = time.time()
+
+        def get_heap_mem_usage(self):
+            return self._heap_mem_usage + self._potential_mem_incr
+
+    def __init__(self, stats_expiration_time):
+        self._lock = threading.Lock()
+        self._stats_granular = 0
+        self._stats_start_key = None
+        self._stats_expiration_time = stats_expiration_time
+        self._stats_map = {}
+
+    def CheckOomRisk(self, stats_key,
+                     water_level_percent,
+                     potential_mem_incr=0):
+        if not self._need_heap_stats(stats_key):
+            return False
+        inner_key = self._gen_inner_stats_key(stats_key)
+        sr = None
+        with self._lock:
+            if inner_key not in self._stats_map:
+                inner_key = self._gen_inner_stats_key(stats_key)
+                self._stats_map[inner_key] = \
+                        _HeapMemStats.StatsRecord(potential_mem_incr,
+                                                  self._stats_expiration_time)
+            sr = self._stats_map[inner_key]
+            if not sr.stats_expiration():
+                return _get_mem_usage_proxy().check_heap_mem_water_level(
+                        sr.get_heap_mem_usage(),
+                        water_level_percent
+                    )
+        assert sr is not None
+        sr.update_stats()
+        return _get_mem_usage_proxy().check_heap_mem_water_level(
+                sr.get_heap_mem_usage(), water_level_percent
+            )
+
+    def _gen_inner_stats_key(self, stats_key):
+        return int(stats_key // self._stats_granular * self._stats_granular)
+
+    def _need_heap_stats(self, stats_key):
+        with self._lock:
+            if self._stats_granular <= 0 and \
+                    _get_mem_usage_proxy().check_rss_mem_water_level(0.5):
+                self._stats_granular = stats_key // 16
+                self._stats_start_key = stats_key // 2
+                if self._stats_granular <= 0:
+                    self._stats_granular = 1
+                logging.warning('auto turing the heap stats granular as %d',
+                                self._stats_granular)
+            return self._stats_granular > 0 and \
+                    stats_key >= self._stats_start_key
+
+def get_heap_mem_stats(stats_expiration_time):
+    return _HeapMemStats(stats_expiration_time)
+
+def get_kvstore_config(kvstore_type):
+    if kvstore_type == 'mysql':
+        database = os.environ.get('DB_DATABASE', 'fedlearner')
+        host = os.environ.get('DB_HOST', '127.0.0.1')
+        port = os.environ.get('DB_PORT', '3306')
+        addr = host + ':' + port
+        username = os.environ.get('DB_USERNAME', 'fedlearner')
+        password = os.environ.get('DB_PASSWORD', 'fedlearner')
+        base_dir = os.environ.get('DB_BASE_DIR', 'fedlearner')
+        return database, addr, username, password, base_dir
+    name = os.environ.get('ETCD_NAME', 'fedlearner')
+    addr = os.environ.get('ETCD_ADDR', 'localhost:2379')
+    base_dir = os.environ.get('ETCD_BASE_DIR', 'fedlearner')
+    return name, addr, None, None, base_dir

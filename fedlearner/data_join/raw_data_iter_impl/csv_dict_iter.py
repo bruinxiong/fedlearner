@@ -18,9 +18,11 @@ import logging
 import csv
 import os
 import io
+import traceback
 from collections import OrderedDict
 
 import tensorflow.compat.v1 as tf
+import tensorflow_io # pylint: disable=unused-import
 from tensorflow.compat.v1 import gfile
 
 import fedlearner.data_join.common as common
@@ -37,8 +39,6 @@ class CsvItem(RawDataIter.Item):
             logging.error("Failed parse example id since no join "\
                           "id in csv dict raw %s", self._raw)
             return common.InvalidExampleId
-        if isinstance(self._raw['example_id'], bytes):
-            return self._raw['example_id']
         return str(self._raw['example_id']).encode()
 
     @property
@@ -47,8 +47,8 @@ class CsvItem(RawDataIter.Item):
             try:
                 return int(self._raw['event_time'])
             except Exception as e: # pylint: disable=broad-except
-                logging.error("Failed to parse event time as int "\
-                              "type from %s", self._raw['event_time'])
+                logging.error("Failed to parse event time as int type from "\
+                              "%s, reason: %s", self._raw['event_time'], e)
         return common.InvalidEventTime
 
     @property
@@ -56,9 +56,7 @@ class CsvItem(RawDataIter.Item):
         if 'raw_id' not in self._raw:
             logging.error("Failed parse raw id since no join "\
                           "id in csv dict raw %s", self._raw)
-            return ''
-        if isinstance(self._raw['raw_id'], bytes):
-            return self._raw['raw_id']
+            return common.InvalidRawId
         return str(self._raw['raw_id']).encode()
 
     @property
@@ -113,6 +111,7 @@ class CsvDictIter(RawDataIter):
                     logging.fatal("the schema of %s is %s, mismatch "\
                                   "with previous %s", fpath,
                                   self._headers, dict_reader.fieldnames)
+                    traceback.print_stack()
                     os._exit(-1) # pylint: disable=protected-access
                 for raw in dict_reader:
                     yield CsvItem(raw)
@@ -129,6 +128,7 @@ class CsvDictIter(RawDataIter):
         elif idx == -1 and len(read_buffer) > 0:
             logging.fatal("not meet line break in size %d",
                           self._options.read_ahead_size)
+            traceback.print_stack()
             os._exit(-1) # pylint: disable=protected-access
         str_buffer = read_buffer[0:idx+1] if len(rest_buffer) == 0 \
                         else rest_buffer+read_buffer[0:idx+1]

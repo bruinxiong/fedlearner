@@ -16,17 +16,18 @@
 
 import logging
 import os
-from os import path
+import traceback
 
 from google.protobuf import text_format, empty_pb2
 
+import tensorflow_io # pylint: disable=unused-import
 from tensorflow.compat.v1 import gfile
 
 from fedlearner.common import data_join_service_pb2 as dj_pb
 from fedlearner.data_join import visitor
 from fedlearner.data_join.common import (
     DoneFileSuffix, make_tf_record_iter,
-    partition_repr, example_id_anchor_etcd_key,
+    partition_repr, example_id_anchor_kvstore_key,
     data_source_example_dumped_dir
 )
 from fedlearner.data_join.raw_data_iter_impl import (
@@ -37,7 +38,7 @@ def encode_example_id_dumped_fname(process_index, start_index):
     return '{:06}-{:08}{}'.format(process_index, start_index, DoneFileSuffix)
 
 def decode_index_meta(fpath):
-    fname = path.basename(fpath)
+    fname = os.path.basename(fpath)
     index_str = fname[:-len(DoneFileSuffix)]
     try:
         items = index_str.split('-')
@@ -47,14 +48,15 @@ def decode_index_meta(fpath):
     except Exception as e: # pylint: disable=broad-except
         logging.fatal("fname %s not satisfied with pattern process_index-"\
                       "start_index", fname)
+        traceback.print_stack()
         os._exit(-1) # pylint: disable=protected-access
     else:
         return visitor.IndexMeta(process_index, start_index, fpath)
     return None
 
 class ExampleIdManager(visitor.IndexMetaManager):
-    def __init__(self, etcd, data_source, partition_id, visit_only):
-        self._etcd = etcd
+    def __init__(self, kvstore, data_source, partition_id, visit_only):
+        self._kvstore = kvstore
         self._data_source = data_source
         self._partition_id = partition_id
         self._visit_only = visit_only
@@ -99,8 +101,8 @@ class ExampleIdManager(visitor.IndexMetaManager):
         process_index = index_meta.process_index
         start_index = index_meta.start_index
         fpath = index_meta.fpath
-        dirname = path.dirname(fpath)
-        fname = path.basename(fpath)
+        dirname = os.path.dirname(fpath)
+        fname = os.path.basename(fpath)
         if not gfile.Exists(fpath):
             raise ValueError("file {} is not existed".format(fpath))
         if dirname != self._example_dumped_dir():
@@ -137,12 +139,12 @@ class ExampleIdManager(visitor.IndexMetaManager):
                     )
                 )
             self._anchor = None
-            etcd_key = example_id_anchor_etcd_key(
+            kvstore_key = example_id_anchor_kvstore_key(
                     self._data_source.data_source_meta.name,
                     self._partition_id
                 )
-            self._etcd.set_data(
-                    etcd_key, text_format.MessageToString(new_anchor)
+            self._kvstore.set_data(
+                    kvstore_key, text_format.MessageToString(new_anchor)
                 )
             self._anchor = new_anchor
 
@@ -164,11 +166,12 @@ class ExampleIdManager(visitor.IndexMetaManager):
             if index != index_meta.process_index:
                 logging.fatal("%s has error process index. expected %d",
                               index_meta.fpath, index)
+                traceback.print_stack()
                 os._exit(-1) # pylint: disable=protected-access
         return index_metas
 
     def _decode_index_meta(self, fpath):
-        fname = path.basename(fpath)
+        fname = os.path.basename(fpath)
         index_str = fname[:-len(DoneFileSuffix)]
         try:
             items = index_str.split('-')
@@ -178,6 +181,7 @@ class ExampleIdManager(visitor.IndexMetaManager):
         except Exception as e: # pylint: disable=broad-except
             logging.fatal("fname %s not satisfied with pattern process_index-"\
                           "start_index", fname)
+            traceback.print_stack()
             os._exit(-1) # pylint: disable=protected-access
         else:
             return visitor.IndexMeta(process_index, start_index, fpath)
@@ -194,17 +198,18 @@ class ExampleIdManager(visitor.IndexMetaManager):
             if not gfile.Exists(fpath):
                 logging.fatal("%d has been dumpped however %s not "\
                               "in file system", start_index, fpath)
+                traceback.print_stack()
                 os._exit(-1) # pylint: disable=protected-access
             return visitor.IndexMeta(process_index, start_index, fpath)
         return None
 
     def _sync_dumped_example_id_anchor(self):
         if self._anchor is None or self._visit_only:
-            etcd_key = example_id_anchor_etcd_key(
+            kvstore_key = example_id_anchor_kvstore_key(
                     self._data_source.data_source_meta.name,
                     self._partition_id
                 )
-            data = self._etcd.get_data(etcd_key)
+            data = self._kvstore.get_data(kvstore_key)
             anchor = dj_pb.DumpedExampleIdAnchor()
             if data is None:
                 self._anchor = \
@@ -229,6 +234,7 @@ class ExampleIdManager(visitor.IndexMetaManager):
             gfile.MakeDirs(example_dumped_dir)
         if not gfile.IsDirectory(example_dumped_dir):
             logging.fatal("%s should be directory", example_dumped_dir)
+            traceback.print_stack()
             os._exit(-1) # pylint: disable=protected-access
 
 class ExampleIdVisitor(visitor.Visitor):
@@ -276,10 +282,10 @@ class ExampleIdVisitor(visitor.Visitor):
                             )
                         index += 1
 
-    def __init__(self, etcd, data_source, partition_id):
+    def __init__(self, kvstore, data_source, partition_id):
         super(ExampleIdVisitor, self).__init__(
                 "example_id_visitor",
-                ExampleIdManager(etcd, data_source, partition_id, True)
+                ExampleIdManager(kvstore, data_source, partition_id, True)
             )
 
     def active_visitor(self):

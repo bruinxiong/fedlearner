@@ -17,6 +17,7 @@
 ACCESS_KEY_ID=$1
 ACCESS_KEY_SECRET=$2
 DB_PASSWORD=$3
+BUCKET=$4
 
 REGION="cn-beijing"
 ZONE_ID="cn-beijing-h"
@@ -105,6 +106,10 @@ function init_policy {
     create_role AliyunCSServerlessKubernetesRole AliyunCSServerlessKubernetesRolePolicy cs.aliyuncs.com
     create_role AliyunESSDefaultRole             AliyunESSRolePolicy                    cs.aliyuncs.com
 
+}
+
+function create_oss_bucket {
+    aliyun oss mb oss://$BUCKET --storage-class Standard >/dev/null 2>&1
 }
 
 function create_vpc {
@@ -203,12 +208,16 @@ function create_k8s_cluster_config {
         "version": "19.03.5"
     },
     "worker_instance_types": [
-        "ecs.s6-c1m2.xlarge"
+        "ecs.c6.3xlarge"
     ],
     "num_of_nodes": 3,
     "worker_system_disk_category": "cloud_efficiency",
     "worker_system_disk_size": 120,
-    "worker_instance_charge_type": "PostPaid",
+    "worker_instance_charge_type": "PrePaid",
+    "worker_period_unit": "Month",
+    "worker_period": 1,
+    "worker_auto_renew": true,
+    "worker_auto_renew_period": 1,
     "vpcid": "$VPC_ID",
     "container_cidr": "172.20.0.0/16",
     "service_cidr": "172.21.0.0/20",
@@ -258,12 +267,12 @@ function create_k8s {
 }
 
 function create_db {
-    DB_INSTANCE_ID=`aliyun rds DescribeDBInstances --VpcId $VPC_ID | grep \"DBInstanceId\" | awk -F "\"" '{print $4}'`
+    DB_INSTANCE_ID=`aliyun rds DescribeDBInstances --VpcId $VPC_ID | grep \"DBInstanceId\" | awk -F "\"" '{print $4}' | head -1`
     if [ -n "$DB_INSTANCE_ID" ]
     then
         echo_log "Database already exists with id $DB_INSTANCE_ID."
     else
-        aliyun rds CreateDBInstance --Engine MySQL --EngineVersion 8.0 --DBInstanceClass rds.mysql.t1.small --DBInstanceStorage 20  --SecurityIPList 0.0.0.0/0 --PayType Postpaid --DBInstanceNetType Intranet --RegionId $REGION --ZoneId $ZONE_ID --VPCId $VPC_ID --InstanceNetworkType VPC
+        aliyun rds CreateDBInstance --Engine MySQL --EngineVersion 8.0 --DBInstanceClass rds.mysql.t1.small --DBInstanceStorage 20  --SecurityIPList 0.0.0.0/0 --DBInstanceNetType Intranet --RegionId $REGION --ZoneId $ZONE_ID --VPCId $VPC_ID --InstanceNetworkType VPC --PayType Prepaid --UsedTime 1 --Period Month --AutoRenew true
         DB_INSTANCE_ID=`aliyun rds DescribeDBInstances --VpcId $VPC_ID | grep \"DBInstanceId\" | awk -F "\"" '{print $4}'`
         if [ -n "$DB_INSTANCE_ID" ]
         then
@@ -561,6 +570,7 @@ then
 else
     install_cli
     init_policy
+    create_oss_bucket
     create_vpc
     create_vswitch
     create_secret

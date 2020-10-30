@@ -14,10 +14,12 @@
 
 # coding: utf-8
 
+import logging
 import argparse
 import json
 import tensorflow.compat.v1 as tf
 
+from fedlearner.common import metrics
 from fedlearner.common.summary_hook import SummaryHook
 from fedlearner.trainer.bridge import Bridge
 from fedlearner.trainer.estimator import FLEstimator
@@ -25,6 +27,33 @@ from fedlearner.trainer.sparse_estimator import SparseFLEstimator
 from fedlearner.trainer.trainer_master_client import LocalTrainerMasterClient
 from fedlearner.trainer.trainer_master_client import TrainerMasterClient
 
+
+class StepMetricsHook(tf.estimator.SessionRunHook):
+    def __init__(self, tensor_dict=None, every_n_iter=5):
+        if tensor_dict is None:
+            tensor_dict = {}
+        self._tensor_dict = tensor_dict
+        self._every_n_iter = every_n_iter
+        self._iter = 0
+
+    def before_run(self, run_context):
+        return tf.estimator.SessionRunArgs(self._tensor_dict)
+
+    def after_run(self, run_context, run_value):
+        self._iter += 1
+        if self._iter % self._every_n_iter == 0:
+            for name, value in run_value.results.items():
+                metrics.emit_store(name=name,
+                                   value=value,
+                                   tags={})
+
+
+class StepLossAucMetricsHook(StepMetricsHook):
+    def __init__(self, loss_tensor, auc_tensor, every_n_iter=5):
+        tensor_dict = {"loss": loss_tensor,
+                       "auc": auc_tensor}
+        super(StepLossAucMetricsHook, self).__init__(tensor_dict,
+                                                     every_n_iter)
 
 def create_argument_parser():
     parser = argparse.ArgumentParser(description='FedLearner Trainer.')
@@ -100,11 +129,25 @@ def create_argument_parser():
                         type=int,
                         default=None,
                         help='Number of steps to save summary files.')
+    parser.add_argument('--verbosity',
+                        type=int,
+                        default=1,
+                        help='Logging level.')
 
     return parser
 
 
 def train(role, args, input_fn, model_fn, serving_input_receiver_fn):
+    logging.basicConfig(
+        format="%(asctime)-15s [%(filename)s:%(lineno)d] " \
+               "%(levelname)s : %(message)s")
+    if args.verbosity == 0:
+        logging.getLogger().setLevel(logging.WARNING)
+    elif args.verbosity == 1:
+        logging.getLogger().setLevel(logging.INFO)
+    elif args.verbosity > 1:
+        logging.getLogger().setLevel(logging.DEBUG)
+
     if args.application_id:
         bridge = Bridge(role, int(args.local_addr.split(':')[1]),
                         args.peer_addr, args.application_id, args.worker_rank)
@@ -182,6 +225,7 @@ def train(role, args, input_fn, model_fn, serving_input_receiver_fn):
                                       trainer_master,
                                       role,
                                       worker_rank=args.worker_rank,
+                                      application_id=args.application_id,
                                       cluster_spec=cluster_spec)
     else:
         estimator = FLEstimator(model_fn,
@@ -189,6 +233,7 @@ def train(role, args, input_fn, model_fn, serving_input_receiver_fn):
                                 trainer_master,
                                 role,
                                 worker_rank=args.worker_rank,
+                                application_id=args.application_id,
                                 cluster_spec=cluster_spec)
 
     run_mode = args.mode.lower()
@@ -202,7 +247,7 @@ def train(role, args, input_fn, model_fn, serving_input_receiver_fn):
     else:
         raise ValueError('Allowed values are: --mode=train|eval')
 
-    if args.export_path:
+    if args.export_path and args.worker_rank == 0:
         estimator.export_saved_model(args.export_path,
                                      serving_input_receiver_fn,
                                      checkpoint_path=args.checkpoint_path)

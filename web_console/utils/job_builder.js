@@ -1,5 +1,29 @@
+/**
+ * Common utility for Kubernetes job YAML generation
+ *
+ * Prerequisites:
+ * - value of env must be string
+ * - use `${var}` to simply transform var from number to string
+ *
+ * ref: https://kubernetes.io/docs/tasks/inject-data-application/
+ */
+
 const assert = require('assert');
 const lodash = require('lodash');
+const getConfig = require('./get_confg');
+
+const { NAMESPACE, ES_HOST, ES_PORT, DB_HOST, DB_PORT,
+        DB_DATABASE, DB_USERNAME, DB_PASSWORD, KVSTORE_TYPE } = getConfig({
+  NAMESPACE: process.env.NAMESPACE,
+  ES_HOST: process.env.ES_HOST,
+  ES_PORT: process.env.ES_PORT,
+  DB_HOST: process.env.DB_HOST,
+  DB_PORT: process.env.DB_PORT,
+  DB_DATABASE: process.env.DB_DATABASE,
+  DB_USERNAME: process.env.DB_USERNAME,
+  DB_PASSWORD: process.env.DB_PASSWORD,
+  KVSTORE_TYPE: process.env.KVSTORE_TYPE,
+});
 
 function joinPath(base, ...rest) {
   const list = [base.replace(/\/$/, '')];
@@ -16,7 +40,6 @@ const permittedJobEnvs = {
     'MIN_MATCHING_WINDOW', 'MAX_MATCHING_WINDOW',
     'DATA_BLOCK_DUMP_INTERVAL', 'DATA_BLOCK_DUMP_THRESHOLD',
     'EXAMPLE_ID_DUMP_INTERVAL', 'EXAMPLE_ID_DUMP_THRESHOLD',
-    'EXAMPLE_ID_BATCH_SIZE', 'MAX_FLYING_EXAMPLE_ID',
   ],
   psi_data_join: [],
   tree_model: [
@@ -24,7 +47,10 @@ const permittedJobEnvs = {
     'L2_REGULARIZATION', 'MAX_BINS', 'NUM_PARALELL',
     'VERIFY_EXAMPLE_IDS', 'USE_STREAMING',
   ],
-  nn_model: ['MODEL_NAME', 'SAVE_CHECKPOINT_STEPS'],
+  nn_model: [
+    'MODEL_NAME', 'SAVE_CHECKPOINT_STEPS', 'SAVE_CHECKPOINT_SECS',
+    'BATCH_SIZE', 'LEARNING_RATE'
+  ],
 };
 
 function mergeCustomizer(obj, src, key) {
@@ -49,13 +75,30 @@ function validateTicket(ticket, params) {
 }
 
 function clientValidateJob(job, client_ticket, server_ticket) {
+  if (job.job_type != client_ticket.job_type) {
+    throw new Error(`client_ticket.job_type ${client_ticket.job_type} does not match job.job_type ${job.job_type}`);
+  }
+  if (job.job_type != server_ticket.job_type) {
+    throw new Error(`server_ticket.job_type ${server_ticket.job_type} does not match job.job_type ${job.job_type}`);
+  }
+  if (client_ticket.role === server_ticket.role) {
+    throw new Error(`client_ticket.role ${client_ticket.role} must be different from server_ticket.role ${server_ticket.role}`);
+  }
+
+  if (job.server_params) {
+    let client_replicas = job.client_params.spec.flReplicaSpecs["Worker"]["replicas"];
+    let server_replicas = job.server_params.spec.flReplicaSpecs["Worker"]["replicas"];
+    if (client_replicas != server_replicas) {
+      throw new Error(`replicas in client_params ${client_replicas} is different from replicas in server_params ${server_replicas}`);
+    }
+  }
   return true;
 }
 
-// Only allow some fields to be used from job.server_params because
+// Only allow some fields to be used from job params because
 // it is received from peers and cannot be totally trusted.
 function extractPermittedJobParams(job) {
-  const params = job.server_params;
+  const params = job.client_params;
   const permitted_envs = permittedJobEnvs[job.job_type];
   const extracted = {};
 
@@ -117,7 +160,7 @@ function generateYaml(federation, job, job_params, ticket) {
     kind: 'FLApp',
     metadata: {
       name: job.name,
-      namespace: k8s_settings.namespace,
+      namespace: NAMESPACE,
     },
     spec: {
       role: ticket.role,
@@ -149,11 +192,24 @@ function generateYaml(federation, job, job_params, ticket) {
           restartPolicy: 'Never',
           containers: [{
             env: [
+              { name: 'STORAGE_ROOT_PATH', value: k8s_settings.storage_root_path },
               { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },
               { name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
               { name: 'ROLE', value: ticket.role.toLowerCase() },
               { name: 'APPLICATION_ID', value: job.name },
               { name: 'OUTPUT_BASE_DIR', value: output_base_dir },
+              { name: 'CPU_REQUEST', valueFrom: { resourceFieldRef: { resource: 'requests.cpu' } } },
+              { name: 'MEM_REQUEST', valueFrom: { resourceFieldRef: { resource: 'requests.memory' } } },
+              { name: 'CPU_LIMIT', valueFrom: { resourceFieldRef: { resource: 'limits.cpu' } } },
+              { name: 'MEM_LIMIT', valueFrom: { resourceFieldRef: { resource: 'limits.memory' } } },
+              { name: 'ES_HOST', value: ES_HOST },
+              { name: 'ES_PORT', value: `${ES_PORT}` },
+              { name: 'DB_HOST', value: `${DB_HOST}` },
+              { name: 'DB_PORT', value: `${DB_PORT}` },
+              { name: 'DB_DATABASE', value: `${DB_DATABASE}` },
+              { name: 'DB_USERNAME', value: `${DB_USERNAME}` },
+              { name: 'DB_PASSWORD', value: `${DB_PASSWORD}` },
+              { name: 'KVSTORE_TYPE', value: `${KVSTORE_TYPE}` },
             ],
             imagePullPolicy: 'IfNotPresent',
             name: 'tensorflow',
@@ -201,7 +257,7 @@ function portalGenerateYaml(federation, raw_data) {
     kind: 'FLApp',
     metadata: {
       name: raw_data.name,
-      namespace: k8s_settings.namespace,
+      namespace: NAMESPACE,
     },
     spec: {
       role: 'Follower',
@@ -227,11 +283,20 @@ function portalGenerateYaml(federation, raw_data) {
         restartPolicy: 'Never',
         containers: [{
           env: [
+            { name: 'STORAGE_ROOT_PATH', value: k8s_settings.storage_root_path },
             { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },
             { name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
+            { name: 'ES_HOST', value: ES_HOST },
+            { name: 'ES_PORT', value: `${ES_PORT}` },
+            { name: 'DB_HOST', value: `${DB_HOST}` },
+            { name: 'DB_PORT', value: `${DB_PORT}` },
+            { name: 'DB_DATABASE', value: `${DB_DATABASE}` },
+            { name: 'DB_USERNAME', value: `${DB_USERNAME}` },
+            { name: 'DB_PASSWORD', value: `${DB_PASSWORD}` },
+            { name: 'KVSTORE_TYPE', value: `${KVSTORE_TYPE}` },
             { name: 'APPLICATION_ID', value: raw_data.name },
             { name: 'DATA_PORTAL_NAME', value: raw_data.name },
-            { name: 'OUTPUT_PARTITION_NUM', value: String(raw_data.output_partition_num) },
+            { name: 'OUTPUT_PARTITION_NUM', value: `${raw_data.output_partition_num}` },
             { name: 'INPUT_BASE_DIR', value: raw_data.input },
             { name: 'OUTPUT_BASE_DIR', value: joinPath(k8s_settings.storage_root_path, 'raw_data', raw_data.name) },
             { name: 'RAW_DATA_PUBLISH_DIR', value: joinPath('portal_publish_dir', raw_data.name) },
@@ -254,16 +319,23 @@ function portalGenerateYaml(federation, raw_data) {
         restartPolicy: 'Never',
         containers: [{
           env: [
+            { name: 'STORAGE_ROOT_PATH', value: k8s_settings.storage_root_path },
             { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },
             { name: 'POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
             { name: 'CPU_REQUEST', valueFrom: { resourceFieldRef: { resource: 'requests.cpu' } } },
             { name: 'MEM_REQUEST', valueFrom: { resourceFieldRef: { resource: 'requests.memory' } } },
             { name: 'CPU_LIMIT', valueFrom: { resourceFieldRef: { resource: 'limits.cpu' } } },
             { name: 'MEM_LIMIT', valueFrom: { resourceFieldRef: { resource: 'limits.memory' } } },
+            { name: 'ES_HOST', value: ES_HOST },
+            { name: 'ES_PORT', value: `${ES_PORT}` },
+            { name: 'DB_HOST', value: `${DB_HOST}` },
+            { name: 'DB_PORT', value: `${DB_PORT}` },
+            { name: 'DB_DATABASE', value: `${DB_DATABASE}` },
+            { name: 'DB_USERNAME', value: `${DB_USERNAME}` },
+            { name: 'DB_PASSWORD', value: `${DB_PASSWORD}` },
+            { name: 'KVSTORE_TYPE', value: `${KVSTORE_TYPE}` },
             { name: 'APPLICATION_ID', value: raw_data.name },
-            { name: 'BATCH_SIZE', value: String(raw_data.context.batch_size) },
-            { name: 'MAX_FLYING_ITEM', value: String(raw_data.context.max_flying_item) },
-            { name: 'MERGE_BUFFER_SIZE', value: String(raw_data.context.merge_buffer_size) },
+            { name: 'BATCH_SIZE', value: raw_data.context.batch_size ? `${raw_data.context.batch_size}` : ""  },
             { name: 'INPUT_DATA_FORMAT', value: raw_data.context.input_data_format },
             { name: 'COMPRESSED_TYPE', value: raw_data.context.compressed_type },
             { name: 'OUTPUT_DATA_FORMAT', value: raw_data.context.output_data_format },

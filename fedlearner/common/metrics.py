@@ -17,6 +17,9 @@
 import logging
 import os
 import time
+import datetime
+from functools import wraps
+import pytz
 try:
     import thread
     import threading
@@ -63,31 +66,41 @@ class Handler(object):
         raise NotImplementedError('emit must be implemented '
                                   'by Handler subclasses')
 
+    def get_name(self):
+        return self._name
 
-class loggingHandler(Handler):
+class LoggingHandler(Handler):
     def __init__(self):
-        super(loggingHandler, self).__init__('logging')
+        super(LoggingHandler, self).__init__('logging')
 
     def emit(self, name, value, tags=None, metrics_type=None):
-        logging.info('[metrics] name[%s] value[%s] tags[%s]', name, value,
-                     str(tags))
+        logging.debug('[metrics] name[%s] value[%s] tags[%s]',
+                      name, value, str(tags))
 
 
-class elasticSearchHandler(Handler):
+class ElasticSearchHandler(Handler):
     def __init__(self, ip, port):
         from elasticsearch import Elasticsearch # pylint: disable=C0415
-        super(elasticSearchHandler, self).__init__('elasticsearch')
+        super(ElasticSearchHandler, self).__init__('elasticsearch')
         self._es = Elasticsearch([ip], port=port)
+        self._tz = pytz.timezone('Asia/Shanghai')
+        es_logger = logging.getLogger('elasticsearch')
+        es_logger.setLevel(logging.WARNING)
         # initialize index for elastic search
         if self._es.indices.exists(index='metrics') is not True:
             self._es.indices.create(index='metrics')
 
     def emit(self, name, value, tags=None, metrics_type=None):
+        if tags is None:
+            tags = {}
+        application_id = os.environ.get('APPLICATION_ID', '')
+        if application_id:
+            tags['application_id'] = str(application_id)
         action = {
             "name": name,
             "value": value,
             "tags": tags,
-            "timestamp": int(time.time())
+            "date_time": datetime.datetime.now(tz=self._tz)
         }
         self._es.index(index="metrics", body=action)
 
@@ -132,13 +145,12 @@ class Metrics(object):
 
 
 def initialize_metrics():
+    handler = LoggingHandler()
+    metrics_config(handler)
 
     if os.environ.get('ES_HOST', None) and os.environ.get('ES_PORT', None):
-        handler = elasticSearchHandler(os.environ['ES_HOST'],
-                                       os.environ['ES_PORT'])
-        metrics_config(handler)
-    else:
-        handler = loggingHandler()
+        handler = ElasticSearchHandler(
+            os.environ['ES_HOST'], os.environ['ES_PORT'])
         metrics_config(handler)
 
 
@@ -169,3 +181,18 @@ def emit_timer(name, value, tags=None):
     if not _metrics_client:
         initialize_metrics()
     _metrics_client.emit(name, value, tags, 'timer')
+
+
+def timer(func_name, tags=None):
+    def func_wrapper(func):
+        @wraps(func)
+        def return_wrapper(*args, **kwargs):
+            time_start = time.time()
+
+            result = func(*args, **kwargs)
+            time_end = time.time()
+            time_spend = time_end-time_start
+            emit_timer(func_name, time_spend, tags)
+            return result
+        return return_wrapper
+    return func_wrapper

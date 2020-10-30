@@ -21,8 +21,6 @@ source /app/deploy/scripts/hdfs_common.sh || true
 source /app/deploy/scripts/env_to_args.sh
 
 partitioner_name=$(normalize_env_to_args "--partitioner_name" $NAME)
-raw_data_batch_size=$(normalize_env_to_args "--raw_data_batch_size" $RAW_DATA_BATCH_SIZE)
-max_flying_raw_data=$(normalize_env_to_args "--max_flying_raw_data" $MAX_FLYING_RAW_DATA)
 input_file_wildcard=$(normalize_env_to_args "--input_file_wildcard" $FILE_WILDCARD)
 raw_data_iter=$(normalize_env_to_args "--raw_data_iter" $FILE_FORMAT)
 compressed_type=$(normalize_env_to_args "--compressed_type" $COMPRESSED_TYPE)
@@ -32,6 +30,7 @@ output_builder=$(normalize_env_to_args "--output_builder" $FILE_FORMAT)
 builder_compressed_type=$(normalize_env_to_args "--builder_compressed_type" $BUILDER_COMPRESSED_TYPE)
 
 file_paths=$(normalize_env_to_args "--file_paths" $INPUT_FILE_PATHS)
+kvstore_type=$(normalize_env_to_args "--kvstore_type" $KVSTORE_TYPE) 
 
 python -m fedlearner.data_join.cmd.raw_data_partitioner_cli \
     --input_dir=$INPUT_DIR \
@@ -39,10 +38,7 @@ python -m fedlearner.data_join.cmd.raw_data_partitioner_cli \
     --output_partition_num=$OUTPUT_PARTITION_NUM \
     --total_partitioner_num=$TOTAL_PARTITIONER_NUM \
     --partitioner_rank_id=$INDEX \
-    --etcd_name=$ETCD_NAME \
-    --etcd_addrs=$ETCD_ADDR \
-    --etcd_base_dir=$ETCD_BASE_DIR \
-    $partitioner_name $raw_data_batch_size $max_flying_raw_data \
+    $partitioner_name $kvstore_type\
     $raw_data_iter $compressed_type $read_ahead_size $read_batch_size \
     $output_builder $builder_compressed_type \
     $file_paths $input_file_wildcard 

@@ -21,14 +21,17 @@ import os
 
 from cityhash import CityHash32 # pylint: disable=no-name-in-module
 import tensorflow.compat.v1 as tf
+import tensorflow_io # pylint: disable=unused-import
 from tensorflow.compat.v1 import gfile
 
 from fedlearner.common import data_join_service_pb2 as dj_pb
 from fedlearner.data_join.raw_data_partitioner import RawDataPartitioner
+from fedlearner.data_join.common import get_kvstore_config
 
 if __name__ == "__main__":
     logging.getLogger().setLevel(logging.INFO)
-    logging.basicConfig(format='%(asctime)s %(message)s')
+    logging.basicConfig(format="%(asctime)s %(filename)s "\
+                               "%(lineno)s %(levelname)s - %(message)s")
     parser = argparse.ArgumentParser(description='Raw Data Partitioner')
     parser.add_argument('--partitioner_name', type=str, default='test',
                         help='the name of raw data partitioner')
@@ -60,20 +63,12 @@ if __name__ == "__main__":
     parser.add_argument('--builder_compressed_type', type=str, default='',
                         choices=['', 'ZLIB', 'GZIP'],
                         help='the compressed type for TF_RECORD builder')
-    parser.add_argument('--raw_data_batch_size', type=int, default=2048,
-                        help='the batch size to load raw data')
-    parser.add_argument('--max_flying_raw_data', type=int, default=2<<20,
-                        help='max flying raw data cached output')
     parser.add_argument('--total_partitioner_num', type=int, required=True,
                         help='the number of partitioner worker for input data')
     parser.add_argument('--partitioner_rank_id', type=int, required=True,
                         help='the rank id of partitioner')
-    parser.add_argument('--etcd_name', type=str, default='test_etcd',
-                        help='the name of etcd cluster')
-    parser.add_argument('--etcd_addrs', type=str, default='localhost:2379',
-                        help='the addrs of etcd server')
-    parser.add_argument('--etcd_base_dir', type=str, default='fedlearner_test',
-                        help='the namespace of etcd key')
+    parser.add_argument('--kvstore_type', type=str, default='etcd',
+                        help='the type of kvstore')
     parser.add_argument('--part_field', type=str, default='raw_id',
                         help='the field for raw data partition')
 
@@ -124,13 +119,16 @@ if __name__ == "__main__":
             ),
             partitioner_rank_id=args.partitioner_rank_id,
             batch_processor_options=dj_pb.BatchProcessorOptions(
-                batch_size=args.raw_data_batch_size,
-                max_flying_item=args.max_flying_raw_data
+                batch_size=4096,
+                max_flying_item=-1
             )
         )
+    db_database, db_addr, db_username, db_password, db_base_dir = \
+        get_kvstore_config(args.kvstore_type)
     partitioner = RawDataPartitioner(partitioner_options, args.part_field,
-                                     args.etcd_name, args.etcd_addrs,
-                                     args.etcd_base_dir)
+                                     db_database, db_base_dir,
+                                     db_addr, db_username,
+                                     db_password)
     logging.info("RawDataPartitioner %s of rank %d launched",
                  partitioner_options.partitioner_name,
                  partitioner_options.partitioner_rank_id)

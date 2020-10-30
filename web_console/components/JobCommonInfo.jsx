@@ -1,10 +1,10 @@
 import React, { useMemo } from 'react';
 import css from 'styled-jsx/css';
-import { Table, Link, Text, Card, Description, Popover, useTheme } from '@zeit-ui/react';
+import { Table, Link, Text, Card, Description, Popover, useTheme, Button } from '@zeit-ui/react';
 import useSWR from 'swr';
 
 import { fetcher } from '../libs/http';
-import { getStatusColor, handleStatus, FLAppStatus } from '../utils/job';
+import { getStatusColor, handleStatus, FLAppStatus, getJobStatus } from '../utils/job';
 import Layout from './Layout';
 import Dot from './Dot';
 import Empty from './Empty';
@@ -81,38 +81,40 @@ function useStyles(theme) {
 export default function JobCommonInfo(props) {
   const theme = useTheme();
   const styles = useStyles(theme);
-
   const job = props.job;
+  const pods = useMemo(() => job?.status?.flReplicaStatus ? parsePods(job.status.flReplicaStatus) : null, [job]);
+  const start_time = job?.metadata?.creationTimestamp
+    ? new Date(job.metadata.creationTimestamp).getTime()
+    : '';
+  const options = useMemo(() => ({
+    searchParams: { start_time },
+  }), [job]);
 
-  const pods = useMemo(() => {
-    if (!job || !job.status || !job.status.flReplicaStatus) {
-      return null;
-    }
-    return parsePods(job.status.flReplicaStatus);
-  }, [job]);
-
-  const {
-    data: logsData,
-    error: logsError,
-    isValidating: logsIsValidating,
-  } = useSWR(`job/${job && job.localdata?.name}/logs?start_time=${new Date(job && job.metadata?.creationTimestamp).getTime()}`, fetcher);
+  const { data: logsData, error: logsError, isValidating: logsIsValidating } = useSWR(
+    job && job.localdata && job.metadata
+      ? [`job/${job.localdata.name}/logs`, options]
+      : null,
+    fetcher,
+  );
   const logs = job && job.localdata?.submitted !== false
     ? (logsData && logsData.data) ? logsData.data : ['logs error ' + (logsData?.error || logsError?.message)]
     : null;
+
+  const status = props.jobStatus || getJobStatus(job)
 
   const tableData = useMemo(() => {
     if (pods) {
       return pods.map((item) => ({
         status: item.status,
         pod: item.name.replace(
-          `${job.localdata?.name}-${job.spec?.role.toLowerCase()}-${item.type.toLowerCase()}-`,
+          `${job?.localdata?.name}-${job?.spec?.role.toLowerCase()}-${item.type.toLowerCase()}-`,
           '',
         ),
         type: item.type,
         link: (
           <>
             {
-              job.status?.appState === FLAppStatus.Running && item.status === podStatus.active
+              job?.status?.appState === FLAppStatus.Running && item.status === podStatus.active
                 ? (
                   <Link
                     color
@@ -128,7 +130,7 @@ export default function JobCommonInfo(props) {
             <Link
               color
               target="_blank"
-              href={`/job/pod-log?name=${item.name}&time=${new Date(job.metadata?.creationTimestamp).getTime()}`}
+              href={`/job/pod-log?name=${item.name}&time=${start_time}`}
             >
               Log
             </Link>
@@ -153,8 +155,8 @@ export default function JobCommonInfo(props) {
                 style={{ width: 140 }}
                 content={(
                   <>
-                    <Dot color={getStatusColor(job?.status?.appState)} />
-                    {handleStatus(job?.status?.appState) || '-'}
+                    <Dot color={getStatusColor(status)} />
+                    {status || '-'}
                   </>
                 )}
               />

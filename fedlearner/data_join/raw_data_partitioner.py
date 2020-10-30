@@ -19,12 +19,14 @@ import logging
 import os
 import re
 import gc
+import traceback
 
+import tensorflow_io # pylint: disable=unused-import
 from tensorflow.compat.v1 import gfile
 
 from cityhash import CityHash32 # pylint: disable=no-name-in-module
 
-from fedlearner.common.etcd_client import EtcdClient
+from fedlearner.common.mysql_client import DBClient
 
 from fedlearner.data_join.output_writer_impl import create_output_writer
 from fedlearner.data_join.item_batch_seq_processor import \
@@ -56,12 +58,12 @@ class RawDataBatch(ItemBatch):
         self._raw_datas.append(item)
 
 class RawDataBatchFetcher(ItemBatchSeqProcessor):
-    def __init__(self, etcd, options):
+    def __init__(self, kvstore, options):
         super(RawDataBatchFetcher, self).__init__(
                 options.batch_processor_options.max_flying_item,
             )
         self._raw_data_visitor = FileBasedMockRawDataVisitor(
-                etcd, options.raw_data_options,
+                kvstore, options.raw_data_options,
                 '{}-partitioner-mock-data-source-{:04}'.format(
                         options.partitioner_name,
                         options.partitioner_rank_id
@@ -91,6 +93,7 @@ class RawDataBatchFetcher(ItemBatchSeqProcessor):
                 if index != next_index:
                     logging.fatal("batch raw data visitor is not consecutive, "\
                                   "%d != %d", index, next_index)
+                    traceback.print_stack()
                     os._exit(-1) # pylint: disable=protected-access
                 next_batch.append(item)
                 next_index += 1
@@ -203,13 +206,15 @@ class RawDataPartitioner(object):
                     )
             return self._writer
 
-    def __init__(self, options, part_field, etcd_name,
-                 etcd_addrs, etcd_base_dir, use_mock_etcd=False):
+    def __init__(self, options, part_field, db_database,
+                 db_base_dir, db_addr, db_username,
+                 db_password, use_mock_etcd=False):
         self._options = options
         self._part_field = part_field
-        etcd = EtcdClient(etcd_name, etcd_addrs,
-                          etcd_base_dir, use_mock_etcd)
-        self._raw_data_batch_fetcher = RawDataBatchFetcher(etcd, options)
+        kvstore = DBClient(db_database, db_addr,
+                            db_username, db_password,
+                            db_base_dir, use_mock_etcd)
+        self._raw_data_batch_fetcher = RawDataBatchFetcher(kvstore, options)
         self._next_part_index = None
         self._dumped_process_index = None
         self._flying_writers = []
@@ -265,12 +270,10 @@ class RawDataPartitioner(object):
         assert len(self._flying_writers) == 0
         fetcher = self._raw_data_batch_fetcher
         fetch_finished = False
-        iter_round = 0
         next_index = self._get_next_part_index()
         hint_index = None
         bp_options = self._options.batch_processor_options
-        signal_round_threhold = bp_options.max_flying_item * 3 // \
-                5 // bp_options.batch_size + 1
+        round_dumped_item = 0
         while not fetch_finished:
             fetch_finished, batch, hint_index = \
                     fetcher.fetch_item_batch_by_index(next_index, hint_index)
@@ -282,19 +285,22 @@ class RawDataPartitioner(object):
                     writer = self._get_file_writer(partition_id)
                     writer.append_item(batch.begin_index+index, item)
                 next_index += len(batch)
-                iter_round += 1
-                oom_risk = common.get_oom_risk_checker().check_oom_risk(0.75)
-                if iter_round % signal_round_threhold == 0 or oom_risk:
+                round_dumped_item += len(batch)
+                fly_item_cnt = fetcher.get_flying_item_count()
+                if round_dumped_item // self._options.output_partition_num \
+                        > (1<<21) or \
+                        common.get_heap_mem_stats(None).CheckOomRisk(
+                                fly_item_cnt, 0.65
+                            ):
                     self._finish_file_writers()
                     self._set_next_part_index(next_index)
                     hint_index = self._evict_staless_batch(hint_index,
                                                            next_index-1)
                     logging.info("consumed %d items", next_index-1)
-                    if oom_risk:
-                        gc_cnt = gc.collect()
-                        logging.warning("earily finish writer partition "\
-                                        "writer since oom risk, trigger "\
-                                        "gc %d actively", gc_cnt)
+                    gc_cnt = gc.collect()
+                    logging.warning("finish writer partition trigger "\
+                                    "gc %d actively", gc_cnt)
+                    round_dumped_item = 0
                     self._wakeup_raw_data_fetcher()
             elif not fetch_finished:
                 with self._cond:
@@ -426,15 +432,19 @@ class RawDataPartitioner(object):
             logging.debug("fetch batch begin at %d, len %d. wakeup "\
                           "partitioner", batch.begin_index, len(batch))
             self._wakeup_partitioner()
-            if common.get_oom_risk_checker().check_oom_risk(0.85):
+            fly_item_cnt = fetcher.get_flying_item_count()
+            if common.get_heap_mem_stats(None).CheckOomRisk(fly_item_cnt, 0.70):
                 logging.warning('early stop the raw data fetch '\
                                 'since the oom risk')
                 break
 
     def _raw_data_batch_fetch_cond(self):
         next_part_index = self._get_next_part_index()
+        fetcher = self._raw_data_batch_fetcher
+        fly_item_cnt = fetcher.get_flying_item_count()
         return self._raw_data_batch_fetcher.need_process(next_part_index) and \
-                not common.get_oom_risk_checker().check_oom_risk(0.85)
+                not common.get_heap_mem_stats(None).CheckOomRisk(fly_item_cnt,
+                                                                 0.70)
 
     def _wakeup_partitioner(self):
         self._worker_map['raw_data_partitioner'].wakeup()

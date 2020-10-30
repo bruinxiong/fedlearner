@@ -14,13 +14,18 @@
 
 # coding: utf-8
 
+import os
 import threading
+import json
+
+KVSTORE_LOCAL_PATH = "/tmp/kvstore.db"
+
 try:
     import queue
 except ImportError:
     import Queue as queue
 
-class MockEtcd(object):
+class MockKVStore(object):
     class KV(object):
         def __init__(self, key, value):
             self._key = key
@@ -47,7 +52,7 @@ class MockEtcd(object):
             return self._clnt
 
         def notify(self, key, value):
-            self._queue.put(MockEtcd.KV(key, value))
+            self._queue.put(MockKVStore.KV(key, value))
 
         def wait_for_event(self):
             while True:
@@ -63,6 +68,27 @@ class MockEtcd(object):
         self._lock = threading.Lock()
         self._data = {}
         self._event_notifier = {}
+        self._need_sync = os.environ.get("KVSTORE_MOCK_DISK_SYNC",
+                                         "off") == "on"
+        self._load_from_disk()
+
+
+    def _load_from_disk(self):
+        #ignore events
+        if self._need_sync:
+            if not os.path.exists(KVSTORE_LOCAL_PATH):
+                os.mknod(KVSTORE_LOCAL_PATH)
+                return
+            with open(KVSTORE_LOCAL_PATH, "rb+") as f:
+                json_data = f.read()
+                if json_data != b'':
+                    self._data = json.loads(json_data.decode())
+
+    def _sync_to_disk(self):
+        #ignore events
+        if self._need_sync:
+            with open(KVSTORE_LOCAL_PATH, "wb+") as f:
+                f.write(json.dumps(self._data).encode())
 
     def get(self, key):
         with self._lock:
@@ -76,11 +102,13 @@ class MockEtcd(object):
         with self._lock:
             self._data[key] = value
             self._notify_if_need(key)
+            self._sync_to_disk()
 
     def delete(self, key):
         with self._lock:
             self._data.pop(key, None)
             self._notify_if_need(key)
+            self._sync_to_disk()
 
     def delete_prefix(self, prefix):
         with self._lock:
@@ -91,6 +119,7 @@ class MockEtcd(object):
             for key in deleted:
                 self._data.pop(key, None)
                 self._notify_if_need(key)
+            self._sync_to_disk()
 
     def put_if_not_exists(self, key, value):
         with self._lock:
@@ -98,6 +127,7 @@ class MockEtcd(object):
                 return False
             self._data[key] = value
             self._notify_if_need(key)
+            self._sync_to_disk()
             return True
 
     def replace(self, key, old_value, new_value):
@@ -109,11 +139,12 @@ class MockEtcd(object):
                 return False
             self._data[key] = new_value
             self._notify_if_need(key)
+            self._sync_to_disk()
             return True
 
     def watch(self, key, clnt):
         with self._lock:
-            en = MockEtcd.EventNotifier(clnt)
+            en = MockKVStore.EventNotifier(clnt)
             if key not in self._event_notifier:
                 self._event_notifier[key] = [en]
             else:
@@ -127,13 +158,14 @@ class MockEtcd(object):
                         en for en in self._event_notifier[key] if
                         en.get_client_belongto() == clnt
                     ]
+            self._sync_to_disk()
 
     def get_prefix(self, prefix, sort_order='ascend'):
         kvs = []
         with self._lock:
             for key, value in self._data.items():
                 if key.startswith(prefix):
-                    kvs.append((value.encode(), MockEtcd.KV(key, None)))
+                    kvs.append((value.encode(), MockKVStore.KV(key, None)))
             if sort_order == 'descend':
                 kvs = sorted(kvs, key=lambda kv: kv[1].key, reverse=True)
             elif sort_order == 'ascend':
@@ -148,22 +180,22 @@ class MockEtcd(object):
             for en in self._event_notifier[key]:
                 en.notify(key, value)
 
-class MockEtcdClient(object):
+class MockKVStoreClient(object):
     POOL_LOCK = threading.Lock()
-    MOCK_ETCD_POOL = {}
+    MOCK_KVStore_POOL = {}
 
     def __init__(self, host, port):
         key = '{}:{}'.format(host, port)
         with self.POOL_LOCK:
-            if key not in self.MOCK_ETCD_POOL:
-                self.MOCK_ETCD_POOL[key] = MockEtcd()
-            self._mock_etcd = self.MOCK_ETCD_POOL[key]
+            if key not in self.MOCK_KVStore_POOL:
+                self.MOCK_KVStore_POOL[key] = MockKVStore()
+            self._mock_KVStore = self.MOCK_KVStore_POOL[key]
 
     def __getattr__(self, attr):
-        return getattr(self._mock_etcd, attr)
+        return getattr(self._mock_KVStore, attr)
 
     def watch(self, key):
-        return self._mock_etcd.watch(key, self)
+        return self._mock_KVStore.watch(key, self)
 
     def close(self):
-        self._mock_etcd.close(self)
+        self._mock_KVStore.close(self)

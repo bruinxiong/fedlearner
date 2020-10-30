@@ -15,6 +15,9 @@
 # coding: utf-8
 
 import logging
+import time
+
+from fedlearner.common import metrics
 
 import fedlearner.data_join.common as common
 from fedlearner.data_join.joiner_impl.example_joiner import ExampleJoiner
@@ -102,11 +105,12 @@ class _JoinWindow(object):
 
 class StreamExampleJoiner(ExampleJoiner):
     def __init__(self, example_joiner_options, raw_data_options,
-                 data_block_builder_options, etcd, data_source, partition_id):
+                 data_block_builder_options, kvstore, data_source,
+                 partition_id):
         super(StreamExampleJoiner, self).__init__(example_joiner_options,
                                                   raw_data_options,
                                                   data_block_builder_options,
-                                                  etcd, data_source,
+                                                  kvstore, data_source,
                                                   partition_id)
         self._min_window_size = example_joiner_options.min_matching_window
         self._max_window_size = example_joiner_options.max_matching_window
@@ -127,37 +131,33 @@ class StreamExampleJoiner(ExampleJoiner):
             return
         sync_example_id_finished, raw_data_finished = \
                 self._prepare_join(state_stale)
-        while self._fill_leader_join_window(sync_example_id_finished) and \
-                self._leader_join_window.size() > 0:
+        join_data_finished = False
+        while self._fill_leader_join_window(sync_example_id_finished):
+            leader_exhausted = sync_example_id_finished and \
+                    self._leader_join_window.size() <= \
+                    self._min_window_size / 2
+            follower_exhausted = False
             delay_dump = True
             while delay_dump and \
                     self._fill_follower_join_window(raw_data_finished):
+                follower_exhausted = raw_data_finished and \
+                        self._follower_join_window.size() <= \
+                        self._min_window_size / 2
                 delay_dump = self._need_delay_dump(raw_data_finished)
                 if delay_dump:
                     self._update_join_cache()
                 else:
-                    for (li, le) in self._leader_join_window:
-                        eid = le.example_id
-                        if eid not in self._follower_example_cache and \
-                                eid not in self._joined_cache:
-                            continue
-                        if eid not in self._joined_cache:
-                            self._joined_cache[eid] = \
-                                    self._follower_example_cache[eid]
-                        builder = self._get_data_block_builder(True)
-                        assert builder is not None, \
-                            "data block builder must be not "\
-                            "None if before dummping"
-                        fi, item = self._joined_cache[eid]
-                        builder.append_item(item, li, fi)
-                        if builder.check_data_block_full():
-                            yield self._finish_data_block()
+                    for meta in self._dump_joined_items():
+                        yield meta
                 self._evit_stale_follower_cache()
             if not delay_dump:
                 self._reset_joiner_state(False)
-            else:
+            if leader_exhausted:
+                join_data_finished = not delay_dump
+            elif follower_exhausted:
+                join_data_finished = True
+            if delay_dump or join_data_finished:
                 break
-        join_data_finished = sync_example_id_finished and raw_data_finished
         if self._get_data_block_builder(False) is not None and \
                 (self._need_finish_data_block_since_interval() or
                     join_data_finished):
@@ -183,6 +183,7 @@ class StreamExampleJoiner(ExampleJoiner):
         return True
 
     def _update_join_cache(self):
+        start_tm = time.time()
         new_unjoined_example_ids = []
         for example_id in self._leader_unjoined_example_ids:
             if example_id in self._follower_example_cache:
@@ -191,6 +192,30 @@ class StreamExampleJoiner(ExampleJoiner):
             else:
                 new_unjoined_example_ids.append(example_id)
         self._leader_unjoined_example_ids = new_unjoined_example_ids
+        metrics.emit_timer(name='stream_joiner_update_join_cache',
+                           value=int(time.time()-start_tm),
+                           tags=self._metrics_tags)
+
+    def _dump_joined_items(self):
+        start_tm = time.time()
+        for (li, le) in self._leader_join_window:
+            eid = le.example_id
+            if eid not in self._follower_example_cache and \
+                    eid not in self._joined_cache:
+                continue
+            if eid not in self._joined_cache:
+                self._joined_cache[eid] = \
+                        self._follower_example_cache[eid]
+            builder = self._get_data_block_builder(True)
+            assert builder is not None, "data block builder must be "\
+                                        "not None if before dummping"
+            fi, item = self._joined_cache[eid]
+            builder.append_item(item, li, fi)
+            if builder.check_data_block_full():
+                yield self._finish_data_block()
+        metrics.emit_timer(name='stream_joiner_dump_joined_items',
+                           value=int(time.time()-start_tm),
+                           tags=self._metrics_tags)
 
     def _reset_joiner_state(self, state_stale):
         self._leader_join_window.reset([], state_stale)
@@ -202,26 +227,43 @@ class StreamExampleJoiner(ExampleJoiner):
             self._follower_example_cache = {}
 
     def _fill_leader_join_window(self, sync_example_id_finished):
-        if self._fill_leader_enough:
-            return True
-        if not self._fill_join_windows(self._leader_visitor,
-                                       self._leader_join_window,
-                                       None):
-            self._fill_leader_enough = sync_example_id_finished
-        else:
-            self._fill_leader_enough = True
-        if self._fill_leader_enough:
-            self._leader_unjoined_example_ids = []
-            for _, item in self._leader_join_window:
-                self._leader_unjoined_example_ids.append(item.example_id)
+        if not self._fill_leader_enough:
+            start_tm = time.time()
+            start_pos = self._leader_join_window.size()
+            if not self._fill_join_windows(self._leader_visitor,
+                                           self._leader_join_window,
+                                           None):
+                self._fill_leader_enough = sync_example_id_finished
+            else:
+                self._fill_leader_enough = True
+            if self._fill_leader_enough:
+                self._leader_unjoined_example_ids = \
+                    [item.example_id for _, item in self._leader_join_window]
+            end_pos = self._leader_join_window.size()
+            eids = [(self._leader_join_window[idx][0],
+                     self._leader_join_window[idx][1].example_id)
+                    for idx in range(start_pos, end_pos)]
+            self._joiner_stats.fill_leader_example_ids(eids)
+            metrics.emit_timer(name='stream_joiner_fill_leader_join_window',
+                               value=int(time.time()-start_tm),
+                               tags=self._metrics_tags)
         return self._fill_leader_enough
 
     def _fill_follower_join_window(self, raw_data_finished):
-        if not self._fill_join_windows(self._follower_visitor,
-                                       self._follower_join_window,
-                                       self._follower_example_cache):
-            return raw_data_finished
-        return True
+        start_tm = time.time()
+        start_pos = self._follower_join_window.size()
+        follower_enough = self._fill_join_windows(self._follower_visitor,
+                                                  self._follower_join_window,
+                                                  self._follower_example_cache)
+        end_pos = self._follower_join_window.size()
+        eids = [(self._follower_join_window[idx][0],
+                 self._follower_join_window[idx][1].example_id)
+                for idx in range(start_pos, end_pos)]
+        self._joiner_stats.fill_follower_example_ids(eids)
+        metrics.emit_timer(name='stream_joiner_fill_leader_join_window',
+                           value=int(time.time()-start_tm),
+                           tags=self._metrics_tags)
+        return follower_enough or raw_data_finished
 
     def _fill_join_windows(self, visitor, join_window, join_cache):
         while not visitor.finished() and \
@@ -241,10 +283,12 @@ class StreamExampleJoiner(ExampleJoiner):
 
     def _evict_if_useless(self, item):
         return item.example_id in self._joined_cache or \
+                self._leader_join_window.committed_pt() is None or \
                 _CmpCtnt(item) < self._leader_join_window.committed_pt()
 
     def _evict_if_force(self, item):
-        return _CmpCtnt(item) < self._leader_join_window.qt()
+        return self._leader_join_window.qt() is None or \
+                _CmpCtnt(item) < self._leader_join_window.qt()
 
     def _evict_impl(self, candidates, filter_fn):
         reserved_items = []
@@ -257,6 +301,7 @@ class StreamExampleJoiner(ExampleJoiner):
         return reserved_items
 
     def _evit_stale_follower_cache(self):
+        start_tm = time.time()
         reserved_items = self._evict_impl(self._follower_join_window,
                                           self._evict_if_useless)
         if len(reserved_items) < self._max_window_size:
@@ -265,6 +310,9 @@ class StreamExampleJoiner(ExampleJoiner):
         reserved_items = self._evict_impl(reserved_items,
                                           self._evict_if_force)
         self._follower_join_window.reset(reserved_items, False)
+        metrics.emit_timer(name='stream_joiner_evit_stale_follower_cache',
+                           value=int(time.time()-start_tm),
+                           tags=self._metrics_tags)
 
     def _consume_item_until_count(self, visitor, windows,
                                   required_item_count, cache=None):

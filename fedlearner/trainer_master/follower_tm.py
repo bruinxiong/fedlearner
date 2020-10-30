@@ -20,11 +20,13 @@ import os
 
 from fedlearner.trainer_master.data.data_block_set import DataBlockSet
 from fedlearner.data_join.data_block_visitor import DataBlockVisitor
+from fedlearner.data_join.common import get_kvstore_config
 from .trainer_master import TrainerMaster
 
-ETCD_NAME = os.environ.get('ETCD_NAME', None)
-ETCD_ADDR = os.environ.get('ETCD_ADDR', None)
-ETCD_BASE_DIR = os.environ.get('ETCD_BASE_DIR', None)
+kvstore_type = os.environ.get('KVSTORE_TYPE', 'etcd')
+db_database, db_addr, db_username, db_password, db_base_dir = \
+    get_kvstore_config(kvstore_type)
+
 
 
 class FollowerTrainerMaster(TrainerMaster):
@@ -33,8 +35,10 @@ class FollowerTrainerMaster(TrainerMaster):
         super(FollowerTrainerMaster, self).__init__(application_id,
                                                     None, online_training)
         self._data_block_set = DataBlockSet()
+        kvstore_use_mock = os.environ.get('KVSTORE_USE_MOCK', "off") == "on"
         self._data_block_visitor = DataBlockVisitor(
-            data_source, ETCD_NAME, ETCD_BASE_DIR, ETCD_ADDR)
+            data_source, db_database, db_base_dir, db_addr,
+                db_username, db_password, kvstore_use_mock)
         self._start_time = start_time
         self._end_time = end_time
 

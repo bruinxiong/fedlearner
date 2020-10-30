@@ -1,7 +1,7 @@
 setuptools==41.0.0
 tensorflow==1.15.2
 cityhash
-pylint
+pylint==2.4.4
 jinja2
 grpcio-tools
 etcd3
@@ -19,3 +19,8 @@ pycryptodomex
 rsa
 elasticsearch
 guppy3
+tensorflow-io==0.8.1
+psutil
+sqlalchemy==1.2.19
+mysqlclient
+multiprocess

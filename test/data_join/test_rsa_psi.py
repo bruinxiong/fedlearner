@@ -31,6 +31,7 @@ import unittest
 import tensorflow.compat.v1 as tf
 tf.enable_eager_execution()
 import numpy as np
+import tensorflow_io
 from tensorflow.compat.v1 import gfile
 from google.protobuf import text_format, empty_pb2, timestamp_pb2
 
@@ -39,7 +40,7 @@ import grpc
 from fedlearner.common import common_pb2 as common_pb
 from fedlearner.common import data_join_service_pb2 as dj_pb
 from fedlearner.common import data_join_service_pb2_grpc as dj_grpc
-from fedlearner.common.etcd_client import EtcdClient
+from fedlearner.common.mysql_client import DBClient
 
 from fedlearner.proxy.channel import make_insecure_channel, ChannelType
 from fedlearner.data_join.rsa_psi import rsa_psi_signer, rsa_psi_preprocessor
@@ -47,20 +48,26 @@ from fedlearner.data_join import data_join_master, data_join_worker,\
                                  common, csv_dict_writer, raw_data_publisher
 
 class RsaPsi(unittest.TestCase):
-    def _setUpEtcd(self):
-        self._etcd_name = 'test_etcd'
-        self._etcd_addrs = 'localhost:2379'
-        self._etcd_base_dir_l = 'byefl_l'
-        self._etcd_base_dir_f= 'byefl_f'
-        self._etcd_l = EtcdClient(self._etcd_name, self._etcd_addrs,
-                                  self._etcd_base_dir_l, True)
-        self._etcd_f = EtcdClient(self._etcd_name, self._etcd_addrs,
-                                  self._etcd_base_dir_f, True)
+    def _setUpMySQL(self):
+        self._db_database = 'test_mysql'
+        self._db_addr = 'localhost:2379'
+        self._db_base_dir_l = 'byefl_l'
+        self._db_base_dir_f= 'byefl_f'
+        self._db_username_l = 'test_user_l'
+        self._db_username_f = 'test_user_f'
+        self._db_password_l = 'test_password_l'
+        self._db_password_f = 'test_password_f'
+        self._kvstore_l = DBClient(self._db_database, self._db_addr,
+                                    self._db_username_l, self._db_password_l,
+                                    self._db_base_dir_l, True)
+        self._kvstore_f = DBClient(self._db_database, self._db_addr,
+                                    self._db_username_f, self._db_password_f,
+                                    self._db_base_dir_f, True)
 
     def _setUpDataSource(self):
         self._data_source_name = 'test_data_source'
-        self._etcd_l.delete_prefix(common.data_source_etcd_base_dir(self._data_source_name))
-        self._etcd_f.delete_prefix(common.data_source_etcd_base_dir(self._data_source_name))
+        self._kvstore_l.delete_prefix(common.data_source_kvstore_base_dir(self._data_source_name))
+        self._kvstore_f.delete_prefix(common.data_source_kvstore_base_dir(self._data_source_name))
         self._data_source_l = common_pb.DataSource()
         self._data_source_l.role = common_pb.FLRole.Leader
         self._data_source_l.state = common_pb.DataSourceState.Init
@@ -80,8 +87,8 @@ class RsaPsi(unittest.TestCase):
         data_source_meta.end_time = 100000000
         self._data_source_l.data_source_meta.MergeFrom(data_source_meta)
         self._data_source_f.data_source_meta.MergeFrom(data_source_meta)
-        common.commit_data_source(self._etcd_l, self._data_source_l)
-        common.commit_data_source(self._etcd_f, self._data_source_f)
+        common.commit_data_source(self._kvstore_l, self._data_source_l)
+        common.commit_data_source(self._kvstore_f, self._data_source_f)
 
     def _generate_input_csv(self, cands, base_dir):
         if not gfile.Exists(base_dir):
@@ -98,12 +105,43 @@ class RsaPsi(unittest.TestCase):
             partition_id = CityHash32(item) % partition_num
             raw = OrderedDict()
             raw['raw_id'] = item
-            raw['feat_0'] = str((partition_id << 30) + 0) + item
-            raw['feat_1'] = str((partition_id << 30) + 1) + item
-            raw['feat_2'] = str((partition_id << 30) + 2) + item
+            raw['feat_0'] = 'leader-' + str((partition_id << 30) + 0) + item
+            raw['feat_1'] = 'leader-' + str((partition_id << 30) + 1) + item
+            raw['feat_2'] = 'leader-' + str((partition_id << 30) + 2) + item
             csv_writers[partition_id].write(raw)
         for csv_writer in csv_writers:
             csv_writer.close()
+        return fpaths
+
+    def _generate_input_tf_record(self, cands, base_dir):
+        if not gfile.Exists(base_dir):
+            gfile.MakeDirs(base_dir)
+        fpaths = []
+        random.shuffle(cands)
+        tfr_writers = []
+        partition_num = self._data_source_l.data_source_meta.partition_num
+        for partition_id in range(partition_num):
+            fpath = os.path.join(base_dir, str(partition_id)+common.RawDataFileSuffix)
+            fpaths.append(fpath)
+            tfr_writers.append(tf.io.TFRecordWriter(fpath))
+        for item in cands:
+            partition_id = CityHash32(item) % partition_num
+            feat = {}
+            feat['raw_id'] = tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[item.encode()]))
+            f0 = 'follower' + str((partition_id << 30) + 0) + item
+            f1 = 'follower' + str((partition_id << 30) + 1) + item
+            f2 = 'follower' + str((partition_id << 30) + 2) + item
+            feat['feat_0'] = tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[f0.encode()]))
+            feat['feat_1'] = tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[f1.encode()]))
+            feat['feat_2'] = tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[f2.encode()]))
+            example = tf.train.Example(features=tf.train.Features(feature=feat))
+            tfr_writers[partition_id].write(example.SerializeToString())
+        for tfr_writer in tfr_writers:
+            tfr_writer.close()
         return fpaths
 
     def _setUpRsaPsiConf(self):
@@ -130,7 +168,7 @@ class RsaPsi(unittest.TestCase):
         self._psi_raw_data_fpaths_l = self._generate_input_csv(
                 list(self._rsa_raw_id_l), self._input_dir_l
             )
-        self._psi_raw_data_fpaths_f = self._generate_input_csv(
+        self._psi_raw_data_fpaths_f = self._generate_input_tf_record(
                 list(self._rsa_raw_id_f), self._input_dir_f
             )
 
@@ -158,13 +196,15 @@ class RsaPsi(unittest.TestCase):
         master_options = dj_pb.DataJoinMasterOptions(use_mock_etcd=True)
         self._master_l = data_join_master.DataJoinMasterService(
                 int(self._master_addr_l.split(':')[1]), self._master_addr_f,
-                self._data_source_name, self._etcd_name, self._etcd_base_dir_l,
-                self._etcd_addrs, master_options 
+                self._data_source_name, self._db_database, self._db_base_dir_l,
+                self._db_addr, self._db_username_l,
+                self._db_password_l, master_options 
             )
         self._master_f = data_join_master.DataJoinMasterService(
                 int(self._master_addr_f.split(':')[1]), self._master_addr_l,
-                self._data_source_name, self._etcd_name, self._etcd_base_dir_f,
-                self._etcd_addrs, master_options 
+                self._data_source_name, self._db_database, self._db_base_dir_f,
+                self._db_addr, self._db_username_f,
+                self._db_password_f, master_options 
             )
         self._master_f.start()
         self._master_l.start()
@@ -192,7 +232,7 @@ class RsaPsi(unittest.TestCase):
         logging.info("masters turn into Processing state")
 
     def _launch_workers(self):
-        worker_options = dj_pb.DataJoinWorkerOptions(
+        worker_options_l = dj_pb.DataJoinWorkerOptions(
                 use_mock_etcd=True,
                 raw_data_options=dj_pb.RawDataOptions(
                     raw_data_iter='TF_RECORD',
@@ -215,9 +255,36 @@ class RsaPsi(unittest.TestCase):
                     max_flying_item=4096
                 ),
                 data_block_builder_options=dj_pb.WriterOptions(
+                    output_writer='CSV_DICT'
+                )
+            )
+        worker_options_f = dj_pb.DataJoinWorkerOptions(
+                use_mock_etcd=True,
+                raw_data_options=dj_pb.RawDataOptions(
+                    raw_data_iter='CSV_DICT',
+                    read_ahead_size=1<<20,
+                    read_batch_size=128
+                ),
+                example_id_dump_options=dj_pb.ExampleIdDumpOptions(
+                    example_id_dump_interval=1,
+                    example_id_dump_threshold=1024
+                ),
+                example_joiner_options=dj_pb.ExampleJoinerOptions(
+                    example_joiner='SORT_RUN_JOINER',
+                    min_matching_window=64,
+                    max_matching_window=256,
+                    data_block_dump_interval=30,
+                    data_block_dump_threshold=1000
+                ),
+                batch_processor_options=dj_pb.BatchProcessorOptions(
+                    batch_size=1024,
+                    max_flying_item=4096
+                ),
+                data_block_builder_options=dj_pb.WriterOptions(
                     output_writer='TF_RECORD'
                 )
             )
+
         self._worker_addrs_l = ['localhost:4161', 'localhost:4162',
                                 'localhost:4163', 'localhost:4164']
         self._worker_addrs_f = ['localhost:5161', 'localhost:5162',
@@ -230,13 +297,15 @@ class RsaPsi(unittest.TestCase):
             self._workers_l.append(data_join_worker.DataJoinWorkerService(
                 int(worker_addr_l.split(':')[1]),
                 worker_addr_f, self._master_addr_l, rank_id,
-                self._etcd_name, self._etcd_base_dir_l,
-                self._etcd_addrs, worker_options))
+                self._db_database, self._db_base_dir_l,
+                self._db_addr, self._db_username_l,
+                self._db_password_l, worker_options_l))
             self._workers_f.append(data_join_worker.DataJoinWorkerService(
                 int(worker_addr_f.split(':')[1]),
                 worker_addr_l, self._master_addr_f, rank_id,
-                self._etcd_name, self._etcd_base_dir_f,
-                self._etcd_addrs, worker_options))
+                self._db_database, self._db_base_dir_f,
+                self._db_addr, self._db_username_f,
+                self._db_password_f, worker_options_f))
         for w in self._workers_l:
             w.start()
         for w in self._workers_f:
@@ -265,7 +334,7 @@ class RsaPsi(unittest.TestCase):
         self._rsa_psi_signer.stop()
 
     def setUp(self):
-        self._setUpEtcd()
+        self._setUpMySQL()
         self._setUpDataSource()
         self._setUpRsaPsiConf()
         self._remove_existed_dir()
@@ -307,8 +376,9 @@ class RsaPsi(unittest.TestCase):
                     )
                 )
             processor = rsa_psi_preprocessor.RsaPsiPreProcessor(
-                    options, self._etcd_name, self._etcd_addrs,
-                    self._etcd_base_dir_l, True
+                    options, self._db_database, self._db_base_dir_l,
+                    self._db_addr, self._db_username_l,
+                    self._db_password_l, True
                 )
             processor.start_process()
             processors.append(processor)
@@ -321,7 +391,7 @@ class RsaPsi(unittest.TestCase):
         with gfile.GFile(self._rsa_public_key_path, 'rb') as f:
             rsa_key_pem = f.read()
         self._follower_rsa_psi_sub_dir = 'follower_rsa_psi_sub_dir'
-        rd_publisher = raw_data_publisher.RawDataPublisher(self._etcd_f, self._follower_rsa_psi_sub_dir)
+        rd_publisher = raw_data_publisher.RawDataPublisher(self._kvstore_f, self._follower_rsa_psi_sub_dir)
         for partition_id in range(self._data_source_f.data_source_meta.partition_num):
             rd_publisher.publish_raw_data(partition_id, [self._psi_raw_data_fpaths_f[partition_id]])
             rd_publisher.finish_raw_data(partition_id)
@@ -347,16 +417,17 @@ class RsaPsi(unittest.TestCase):
                         max_flying_item=1<<14
                     ),
                     input_raw_data=dj_pb.RawDataOptions(
-                        raw_data_iter='CSV_DICT',
+                        raw_data_iter='TF_RECORD',
                         read_ahead_size=1<<20
                     ),
                     writer_options=dj_pb.WriterOptions(
-                        output_writer='TF_RECORD'
+                        output_writer='CSV_DICT'
                     )
                 )
             processor = rsa_psi_preprocessor.RsaPsiPreProcessor(
-                        options, self._etcd_name, self._etcd_addrs,
-                        self._etcd_base_dir_f, True
+                        options, self._db_database, self._db_base_dir_f,
+                        self._db_addr, self._db_username_f,
+                        self._db_password_f, True
                     )
             processor.start_process()
             processors.append(processor)

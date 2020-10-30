@@ -9,11 +9,11 @@ import JobCommonInfo, { jsonHandledPopover } from '../../components/JobCommonInf
 export default function Job() {
   const router = useRouter();
   const { query } = router;
-  const { data: jobData } = useSWR(`job/${query.id}`, fetcher);
+  const { data: jobData } = useSWR(query.id ? `job/${query.id}` : null, fetcher);
   const job = jobData ? jobData.data : null;
 
   return (
-    <JobCommonInfo job={job}>
+    job ? <JobCommonInfo job={job}>
       <Description
         title="Job Type"
         style={{ width: 140 }}
@@ -42,5 +42,6 @@ export default function Job() {
         content={jsonHandledPopover(job?.localdata?.server_params)}
       />
     </JobCommonInfo>
+  : null
   );
 }

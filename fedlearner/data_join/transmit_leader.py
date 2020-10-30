@@ -16,11 +16,12 @@
 
 import threading
 import logging
-import zlib
 
 from fedlearner.common import data_join_service_pb2 as dj_pb
+from fedlearner.common import metrics
 
 from fedlearner.data_join.routine_worker import RoutineWorker
+from fedlearner.data_join import common
 
 class TransmitLeader(object):
     class ImplContext(object):
@@ -66,13 +67,19 @@ class TransmitLeader(object):
                     "in base TransmitLeader ImplContext"
                 )
 
+        def get_flying_item_cnt(self):
+            raise NotImplementedError(
+                    "get_flying_item is not Implemented "\
+                    "in base TransmitLeader ImplContext"
+                )
+
     def __init__(self, peer_client, master_client,
-                 rank_id, etcd, data_source, repr_str):
+                 rank_id, kvstore, data_source, repr_str):
         self._lock = threading.Lock()
         self._peer_client = peer_client
         self._master_client = master_client
         self._rank_id = rank_id
-        self._etcd = etcd
+        self._kvstore = kvstore
         self._data_source = data_source
         self._repr_str = repr_str
         self._partition_exhausted = False
@@ -134,6 +141,8 @@ class TransmitLeader(object):
     def _wakeup_new_partition_allocator(self):
         self._worker_map[self._partition_allocator_name()].wakeup()
 
+    @metrics.timer(func_name='allocate_new_partition_fn',
+                   tags={'role': 'transmit_leader'})
     def _allocate_new_partition_fn(self):
         req = self._make_raw_data_request()
         rsp = self._master_client.RequestJoinPartition(req)
@@ -174,16 +183,29 @@ class TransmitLeader(object):
         self._process_producer_hook(impl_ctx)
         if not impl_ctx.is_produce_finished():
             for item in impl_ctx.make_producer():
-                if item is not None:
-                    self._wakeup_data_consumer()
+                if item is None:
+                    continue
+                self._wakeup_data_consumer()
+                fly_item_cnt = impl_ctx.get_flying_item_cnt()
+                if common.get_heap_mem_stats(None).CheckOomRisk(fly_item_cnt,
+                                                                0.50):
+                    logging.warning("%s early stop produce item since "\
+                                    "oom risk", self._repr_str)
+                    break
 
     def _data_producer_cond(self):
         with self._lock:
+            oom_risk = False
             if self._impl_ctx is not None:
                 self._worker_map[self._producer_name()].setup_args(
                         self._impl_ctx
                     )
-            return self._impl_ctx is not None
+                fly_item_cnt = self._impl_ctx.get_flying_item_cnt()
+                oom_risk = common.get_heap_mem_stats(None).CheckOomRisk(
+                        fly_item_cnt, 0.60
+                    )
+            return self._impl_ctx is not None and not oom_risk and \
+                    not self._impl_ctx.is_produce_finished()
 
     def _wakeup_data_consumer(self):
         self._worker_map[self._consumer_name()].wakeup()
@@ -218,6 +240,8 @@ class TransmitLeader(object):
             self._send_sync_content(impl_ctx, item)
         return consume_finished
 
+    @metrics.timer(func_name='start_partition',
+                   tags={'role': 'transmit_leader'})
     def _start_partition(self, impl_ctx):
         assert isinstance(impl_ctx, TransmitLeader.ImplContext)
         req = dj_pb.StartPartitionRequest(
@@ -233,22 +257,14 @@ class TransmitLeader(object):
         self._update_peer_index(impl_ctx, rsp.next_index, rsp.dumped_index)
         return rsp.finished
 
+    @metrics.timer(func_name='finish_partition',
+                   tags={'role': 'transmit_leader'})
     def _send_sync_content(self, impl_ctx, item):
         assert isinstance(impl_ctx, TransmitLeader.ImplContext)
-        compressed = False
-        sync_ctnt = self._serialize_sync_content(item)
-        if len(sync_ctnt) > (2 << 20):
-            compressed_bytes = zlib.compress(sync_ctnt, 5)
-            if len(compressed_bytes) < len(sync_ctnt) * 0.8:
-                sync_ctnt = compressed_bytes
-                compressed = True
-            else:
-                logging.warning('abandon compressed since compress ratio < 0.8')
         req = dj_pb.SyncPartitionRequest(
                 data_source_meta=self._data_source.data_source_meta,
                 rank_id=self._rank_id,
-                content_bytes=sync_ctnt,
-                compressed=compressed
+                sync_content=self._make_sync_content(item)
             )
         rsp = self._peer_client.SyncPartition(req)
         if rsp.status.code != 0:
@@ -256,6 +272,8 @@ class TransmitLeader(object):
                                 self._repr_str, rsp.status.error_message))
         self._update_peer_index(impl_ctx, rsp.next_index, rsp.dumped_index)
 
+    @metrics.timer(func_name='finish_partition',
+                   tags={'role': 'transmit_leader'})
     def _finish_partition(self, impl_ctx):
         assert isinstance(impl_ctx, TransmitLeader.ImplContext)
         if not impl_ctx.is_peer_finished():
@@ -293,10 +311,12 @@ class TransmitLeader(object):
         raise NotImplementedError("_make_finish_raw_data_request is not "\
                                   "implemented in base TransmitLeader")
 
-    def _serialize_sync_content(self, item):
-        raise NotImplementedError("_serialize_sync_content is not "\
+    def _make_sync_content(self, item):
+        raise NotImplementedError("_make_sync_content is not "\
                                   "implemented in base TransmitLeader")
 
+    @metrics.timer(func_name='update_peer_index',
+                   tags={'role': 'transmit_leader'})
     def _update_peer_index(self, impl_ctx, peer_next_index, peer_dumped_index):
         assert isinstance(impl_ctx, TransmitLeader.ImplContext)
         _, dumped_index = impl_ctx.get_peer_index()
@@ -316,3 +336,12 @@ class TransmitLeader(object):
                                    "to {} reason: {}".format(self._repr_str,
                                                              peer_dumped_index,
                                                              rsp.error_message))
+            metrics.emit_store('peer_dumped_index', peer_dumped_index,
+                               self._get_metrics_tag(impl_ctx))
+
+    def _get_metrics_tag(self, impl_ctx):
+        assert isinstance(impl_ctx, TransmitLeader.ImplContext)
+        ds_name = self._data_source.data_source_meta.name
+        return {'data_source_name': ds_name,
+                'partition': impl_ctx.partition_id,
+                'role': 'transmit_leader'}

@@ -20,6 +20,7 @@ from os import path
 from fnmatch import fnmatch
 
 from google.protobuf import text_format
+import tensorflow_io # pylint: disable=unused-import
 from tensorflow.compat.v1 import gfile
 
 from fedlearner.common import data_portal_service_pb2 as dp_pb
@@ -29,16 +30,17 @@ from fedlearner.data_join.raw_data_publisher import RawDataPublisher
 from fedlearner.data_join.sort_run_merger import MergedSortRunMeta
 
 class DataPortalJobManager(object):
-    def __init__(self, etcd, portal_name, long_running):
+    def __init__(self, kvstore, portal_name, long_running):
         self._lock = threading.Lock()
-        self._etcd = etcd
+        self._kvstore = kvstore
         self._portal_name = portal_name
         self._portal_manifest = None
         self._processing_job = None
         self._sync_portal_manifest()
         self._sync_processing_job()
         self._publisher = \
-            RawDataPublisher(etcd, self._portal_manifest.raw_data_publish_dir)
+            RawDataPublisher(kvstore,
+                self._portal_manifest.raw_data_publish_dir)
         self._long_running = long_running
         assert self._portal_manifest is not None
         self._processed_fpath = set()
@@ -159,12 +161,14 @@ class DataPortalJobManager(object):
         for seq, fpath in enumerate(map_fpaths):
             logging.info("%d. %s", seq, fpath)
         logging.info("---------------------------------\n")
+        manifset = self._sync_portal_manifest()
         return dp_pb.MapTask(task_name=task_name,
                              fpaths=map_fpaths,
                              output_base_dir=self._map_output_dir(job.job_id),
                              output_partition_num=self._output_partition_num,
                              partition_id=partition_id,
-                             part_field=self._get_part_field())
+                             part_field=self._get_part_field(),
+                             data_portal_type=manifset.data_portal_type)
 
     def _get_part_field(self):
         portal_mainifest = self._sync_portal_manifest()
@@ -216,8 +220,8 @@ class DataPortalJobManager(object):
         return alloc_partition_id
 
     def _sync_portal_job(self, job_id):
-        etcd_key = common.portal_job_etcd_key(self._portal_name, job_id)
-        data = self._etcd.get_data(etcd_key)
+        kvstore_key = common.portal_job_kvstore_key(self._portal_name, job_id)
+        data = self._kvstore.get_data(kvstore_key)
         if data is not None:
             return text_format.Parse(data, dp_pb.DataPortalJob())
         return None
@@ -236,14 +240,15 @@ class DataPortalJobManager(object):
 
     def _update_processing_job(self, job):
         self._processing_job = None
-        etcd_key = common.portal_job_etcd_key(self._portal_name, job.job_id)
-        self._etcd.set_data(etcd_key, text_format.MessageToString(job))
+        kvstore_key = common.portal_job_kvstore_key(self._portal_name,
+                                                    job.job_id)
+        self._kvstore.set_data(kvstore_key, text_format.MessageToString(job))
         self._processing_job = job
 
     def _sync_portal_manifest(self):
         if self._portal_manifest is None:
-            etcd_key = common.portal_etcd_base_dir(self._portal_name)
-            data = self._etcd.get_data(etcd_key)
+            kvstore_key = common.portal_kvstore_base_dir(self._portal_name)
+            data = self._kvstore.get_data(kvstore_key)
             if data is not None:
                 self._portal_manifest = \
                     text_format.Parse(data, dp_pb.DataPortalManifest())
@@ -251,9 +256,9 @@ class DataPortalJobManager(object):
 
     def _update_portal_manifest(self, new_portal_manifest):
         self._portal_manifest = None
-        etcd_key = common.portal_etcd_base_dir(self._portal_name)
+        kvstore_key = common.portal_kvstore_base_dir(self._portal_name)
         data = text_format.MessageToString(new_portal_manifest)
-        self._etcd.set_data(etcd_key, data)
+        self._kvstore.set_data(kvstore_key, data)
         self._portal_manifest = new_portal_manifest
 
     def _launch_new_portal_job(self):
@@ -306,9 +311,9 @@ class DataPortalJobManager(object):
         if partition_id not in self._job_part_map or \
                 self._job_part_map[partition_id] is None or \
                 self._job_part_map[partition_id].job_id != job_id:
-            etcd_key = common.portal_job_part_etcd_key(self._portal_name,
+            kvstore_key = common.portal_job_part_kvstore_key(self._portal_name,
                                                        job_id, partition_id)
-            data = self._etcd.get_data(etcd_key)
+            data = self._kvstore.get_data(kvstore_key)
             if data is None:
                 self._job_part_map[partition_id] = dp_pb.PortalJobPart(
                         job_id=job_id, rank_id=-1,
@@ -324,11 +329,11 @@ class DataPortalJobManager(object):
         if partition_id not in self._job_part_map or \
                 self._job_part_map[partition_id] != job_part:
             self._job_part_map[partition_id] = None
-            etcd_key = common.portal_job_part_etcd_key(self._portal_name,
+            kvstore_key = common.portal_job_part_kvstore_key(self._portal_name,
                                                        job_part.job_id,
                                                        partition_id)
             data = text_format.MessageToString(job_part)
-            self._etcd.set_data(etcd_key, data)
+            self._kvstore.set_data(kvstore_key, data)
         self._job_part_map[partition_id] = job_part
 
     def _check_processing_job_finished(self):
@@ -397,8 +402,8 @@ class DataPortalJobManager(object):
                           if f.endswith(common.RawDataFileSuffix)]
             publish_fpaths = []
             if portal_manifest.data_portal_type == dp_pb.DataPortalType.PSI:
-                publish_fpath = self._publish_psi_raw_data(partition_id,
-                                                           dpath, fnames)
+                publish_fpaths = self._publish_psi_raw_data(partition_id,
+                                                            dpath, fnames)
             else:
                 publish_fpaths = self._publish_streaming_raw_data(partition_id,
                                                                  dpath, fnames)

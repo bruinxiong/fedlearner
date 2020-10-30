@@ -22,10 +22,13 @@ import functools
 import os
 import time
 import bisect
+import traceback
 import concurrent.futures as concur_futures
 
 from cityhash import CityHash64 # pylint: disable=no-name-in-module
 from gmpy2 import powmod, divm # pylint: disable=no-name-in-module
+
+from google.protobuf import empty_pb2
 
 from fedlearner.common import data_join_service_pb2_grpc as dj_grpc
 from fedlearner.common import data_join_service_pb2 as dj_pb
@@ -33,7 +36,7 @@ from fedlearner.common import data_join_service_pb2 as dj_pb
 from fedlearner.proxy.channel import make_insecure_channel, ChannelType
 
 from fedlearner.data_join.raw_data_visitor import \
-        FileBasedMockRawDataVisitor, EtcdBasedMockRawDataVisitor
+        FileBasedMockRawDataVisitor, DBBasedMockRawDataVisitor
 from fedlearner.data_join.item_batch_seq_processor import \
         ItemBatch, ItemBatchSeqProcessor
 from fedlearner.data_join.common import int2bytes, bytes2int
@@ -71,11 +74,11 @@ class IdBatch(ItemBatch):
         return iter(zip(self._raw_ids, self._items))
 
 class IdBatchFetcher(ItemBatchSeqProcessor):
-    def __init__(self, etcd, options):
+    def __init__(self, kvstore, options):
         super(IdBatchFetcher, self).__init__(
                 options.batch_processor_options.max_flying_item,
             )
-        self._etcd = etcd
+        self._kvstore = kvstore
         self._options = options
         self._id_visitor = None
         self._batch_size = options.batch_processor_options.batch_size
@@ -105,6 +108,7 @@ class IdBatchFetcher(ItemBatchSeqProcessor):
                 if index != next_index:
                     logging.fatal("index of id visitor is not consecutive, "\
                                   "%d != %d", index, next_index)
+                    traceback.print_stack()
                     os._exit(-1) # pylint: disable=protected-access
                 next_batch.append(item)
                 next_index += 1
@@ -120,7 +124,7 @@ class IdBatchFetcher(ItemBatchSeqProcessor):
                 self.set_input_finished()
         else:
             if self._id_visitor is None:
-                self._id_visitor = self._create_etcd_based_mock_visitor()
+                self._id_visitor = self._create_kvstore_based_mock_visitor()
             self._id_visitor.active_visitor()
             if self._id_visitor.is_input_data_finish():
                 self.set_input_finished()
@@ -128,7 +132,7 @@ class IdBatchFetcher(ItemBatchSeqProcessor):
 
     def _create_file_based_mock_visitor(self):
         return FileBasedMockRawDataVisitor(
-                self._etcd,
+                self._kvstore,
                 self._options.input_raw_data,
                 '{}-rsa_psi_proprocessor-mock-data-source-{:04}'.format(
                     self._options.preprocessor_name,
@@ -137,15 +141,16 @@ class IdBatchFetcher(ItemBatchSeqProcessor):
                 self._options.input_file_paths
             )
 
-    def _create_etcd_based_mock_visitor(self):
-        return EtcdBasedMockRawDataVisitor(
-                self._etcd,
+    def _create_kvstore_based_mock_visitor(self):
+        return DBBasedMockRawDataVisitor(
+                self._kvstore,
                 self._options.input_raw_data,
                 '{}-rsa_psi_proprocessor-mock-data-source-{:04}'.format(
                     self._options.preprocessor_name,
                     self._options.partition_id
                 ),
-                self._options.input_file_subscribe_dir
+                self._options.input_file_subscribe_dir,
+                self._options.partition_id
             )
 
 class SignedIdBatch(ItemBatch):
@@ -202,6 +207,10 @@ class PsiRsaSigner(ItemBatchSeqProcessor):
     def name(cls):
         return 'PsiRsaSigner'
 
+    def say_signer_bye(self):
+        raise NotImplementedError("say_signer_bye not implemented "\
+                                  "in base PsiRsaSigner")
+
     def _make_item_batch(self, begin_index):
         return SignedIdBatch(begin_index)
 
@@ -214,6 +223,10 @@ class PsiRsaSigner(ItemBatchSeqProcessor):
             if self._next_batch_index_hint is not None and \
                     self._next_batch_index_hint >= evit_batch_cnt:
                 self._next_batch_index_hint -= evit_batch_cnt
+
+    def additional_item_mem_usage(self):
+        raise NotImplementedError("additional_item_mem_usage not "\
+                                  "implemented in base PsiRsaSigner")
 
     def _add_sign_stats(self, duration, pending_duration, retry_cnt):
         with self._lock:
@@ -287,8 +300,6 @@ class PsiRsaSigner(ItemBatchSeqProcessor):
             wait4batch = len(raw_id_batches) == 0
             signed_batch_futures += self._promise_signed_batches(raw_id_batches)
         yield self._make_item_batch(next_index), True
-        with self._lock:
-            self._next_index_to_fetch = next_index
 
     def _consum_raw_id_batch(self, next_index, required_num):
         raw_id_batches = []
@@ -307,6 +318,8 @@ class PsiRsaSigner(ItemBatchSeqProcessor):
             next_index += len(raw_id_batch)
             if len(raw_id_batch) > 0:
                 raw_id_batches.append(raw_id_batch)
+        with self._lock:
+            self._next_index_to_fetch = next_index
         return raw_id_batches, next_index
 
     def _promise_signed_batches(self, raw_id_batches):
@@ -356,6 +369,15 @@ class LeaderPsiRsaSigner(PsiRsaSigner):
                                                  slow_sign_threshold,
                                                  process_pool_executor)
         self._private_key = private_key
+        self._item_additional_cost = 256 // 8 + \
+                                     self._private_key.n.bit_length() // 8
+
+    def additional_item_mem_usage(self):
+        return self._item_additional_cost
+
+
+    def say_signer_bye(self):
+        logging.warning("leader signer has no peer signer")
 
     @staticmethod
     def _leader_sign_func(raw_id_batch, d, n):
@@ -400,7 +422,11 @@ class FollowerPsiRsaSigner(PsiRsaSigner):
     class SignerStub(object):
         def __init__(self, addr):
             self._lock = threading.Lock()
-            self._channel = make_insecure_channel(addr, ChannelType.REMOTE)
+            self._channel = make_insecure_channel(
+                    addr, ChannelType.REMOTE,
+                    options=[('grpc.max_send_message_length', 2**31-1),
+                             ('grpc.max_receive_message_length', 2**31-1)]
+                )
             self._stub = dj_grpc.RsaPsiSignServiceStub(self._channel)
             self._serial_fail_cnt = 0
             self._rpc_ref_cnt = 0
@@ -480,7 +506,7 @@ class FollowerPsiRsaSigner(PsiRsaSigner):
                  max_flying_sign_batch, max_flying_sign_rpc,
                  sign_rpc_timeout_ms, slow_sign_threshold,
                  stub_fanout, process_pool_executor,
-                 public_key, leader_signer_addr):
+                 callback_submitter, public_key, leader_signer_addr):
         super(FollowerPsiRsaSigner, self).__init__(id_batch_fetcher,
                                                    max_flying_item,
                                                    max_flying_sign_batch,
@@ -497,6 +523,23 @@ class FollowerPsiRsaSigner(PsiRsaSigner):
                  for _ in range(stub_fanout)]
         self._pending_rpc_sign_ctx = []
         self._flying_rpc_num = 0
+        self._callback_submitter = callback_submitter
+        self._item_additional_cost = 256 * 2 // 8 + \
+                                     self._public_key.n.bit_length() // 8
+
+    def additional_item_mem_usage(self):
+        return self._item_additional_cost
+
+    def say_signer_bye(self):
+        stub = self._get_active_stub()
+        try:
+            stub.Bye(empty_pb2.Empty())
+        except Exception as e: # pylint: disable=broad-except
+            self._revert_stub(stub, True)
+            logging.error("Failed to say Bye to rsa signer: %s, "\
+                          "reason: %s", self._leader_signer_addr, e)
+            raise
+        self._revert_stub(stub, False)
 
     def _get_active_stub(self):
         with self._lock:
@@ -619,10 +662,8 @@ class FollowerPsiRsaSigner(PsiRsaSigner):
             signed_blinded_hashed_ids = [bytes2int(item) for
                                          item in response.signed_ids]
             assert len(ctx.raw_id_batch) == len(signed_blinded_hashed_ids)
-            self._deblind_signed_id_func(ctx.raw_id_batch,
-                                         ctx.blind_numbers,
-                                         signed_blinded_hashed_ids,
-                                         ctx.notify_future)
+            self._callback_submitter.submit(self._deblind_signed_id_func,
+                                            ctx, signed_blinded_hashed_ids)
             next_ctxs = []
             with self._lock:
                 assert self._flying_rpc_num > 0
@@ -648,15 +689,14 @@ class FollowerPsiRsaSigner(PsiRsaSigner):
             ctx.trigger_retry()
             self._rpc_sign_func(ctx)
 
-    def _deblind_signed_id_func(self, raw_id_batch, blind_numbers,
-                                signed_blinded_hashed_ids, notify_future):
+    def _deblind_signed_id_func(self, ctx, signed_blinded_hashed_ids):
         n = self._public_key.n
         deblind_future = self._process_pool_executor.submit(
                 FollowerPsiRsaSigner._deblind_signed_id_batch,
-                signed_blinded_hashed_ids, blind_numbers, n
+                signed_blinded_hashed_ids, ctx.blind_numbers, n
             )
         deblind_cb = functools.partial(self._deblind_callback,
-                                       raw_id_batch, notify_future)
+                                       ctx.raw_id_batch, ctx.notify_future)
         deblind_future.add_done_callback(deblind_cb)
 
     def _deblind_callback(self, raw_id_batch, notify_future, deblind_future):

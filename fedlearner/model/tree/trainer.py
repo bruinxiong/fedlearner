@@ -83,6 +83,10 @@ def create_argument_parser():
                         type=int,
                         default=1,
                         help='Controls the amount of logs to print.')
+    parser.add_argument('--loss-type',
+                        default='logistic',
+                        choices=['logistic', 'mse'],
+                        help='What loss to use for training.')
     parser.add_argument('--learning-rate',
                         type=float,
                         default=0.3,
@@ -130,6 +134,10 @@ def create_argument_parser():
                         type=bool,
                         default=False,
                         help='Whether to send prediction scores to follower.')
+    parser.add_argument('--send-metrics-to-follower',
+                        type=bool,
+                        default=False,
+                        help='Whether to send metrics to follower.')
 
     return parser
 
@@ -196,7 +204,7 @@ def read_data(file_type, filename, require_example_ids,
         lambda x: x not in ignore_fields and x not in cat_fields, field_names))
     cont_columns.sort(key=lambda x: x[1])
     cat_columns = list(filter(
-        lambda x: x in cat_fields and x not in cat_fields, field_names))
+        lambda x: x in cat_fields and x not in ignore_fields, field_names))
     cat_columns.sort(key=lambda x: x[1])
 
     features = []
@@ -238,6 +246,7 @@ def read_data_dir(file_ext, file_type, path, require_example_ids,
             subdirname = os.path.join(path, os.path.relpath(dirname, path))
             files.append(os.path.join(subdirname, filename))
 
+    files.sort()
     features = None
     for fullname in files:
         ifeatures, icat_features, icont_columns, icat_columns, \
@@ -351,8 +360,7 @@ def test_one_file(args, bridge, booster, data_file, output_file):
         example_ids=example_ids,
         cat_features=cat_X,
         feature_names=X_names,
-        cat_feature_names=cat_X_names,
-        send_scores_to_follower=args.send_scores_to_follower)
+        cat_feature_names=cat_X_names)
 
     if y is not None:
         metrics = booster.loss.metrics(pred, y)
@@ -393,7 +401,8 @@ class DataBlockLoader(object):
                 files = [os.path.basename(data_path)]
                 data_path = os.path.dirname(data_path)
             self._trainer_master = LocalTrainerMasterClient(
-                self._tm_role, data_path, files=files, ext=ext)
+                self._tm_role, data_path, files=files, ext=ext,
+                skip_datablock_checkpoint=True)
         else:
             self._trainer_master = None
 
@@ -418,11 +427,12 @@ class DataBlockLoader(object):
         elif self._trainer_master is not None:
             block = self._trainer_master.request_data_block(msg.block_id)
             if block is None:
-                raise ValueError("Block %s not found" % msg.block_id)
+                return False
         else:
             block = DataBlockInfo(msg.block_id, None)
         self._count += 1
         self._block_queue.put(block)
+        return True
 
     def _request_data_block(self):
         while True:
@@ -445,12 +455,8 @@ class DataBlockLoader(object):
             while True:
                 block = self._request_data_block()
                 if block is not None:
-                    try:
-                        self._bridge.load_data_block(self._count,
-                                                     block.block_id)
-                    except Exception as e:  # pylint: disable=broad-except
-                        logging.error('load data block %s with error: %s',
-                                      block.block_id, repr(e))
+                    if not self._bridge.load_data_block(
+                            self._count, block.block_id):
                         continue
                 else:
                     self._bridge.load_data_block(self._count, '')
@@ -512,7 +518,10 @@ def run(args):
             max_depth=args.max_depth,
             l2_regularization=args.l2_regularization,
             max_bins=args.max_bins,
-            num_parallel=args.num_parallel)
+            num_parallel=args.num_parallel,
+            loss_type=args.loss_type,
+            send_scores_to_follower=args.send_scores_to_follower,
+            send_metrics_to_follower=args.send_metrics_to_follower)
 
         if args.load_model_path:
             booster.load_saved_model(args.load_model_path)
