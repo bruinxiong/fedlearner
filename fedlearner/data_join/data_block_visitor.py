@@ -114,11 +114,6 @@ class DataBlockVisitor(object):
                                                  data_source_name)
 
     def LoadDataBlockRepByTimeFrame(self, start_time=None, end_time=None):
-        if (end_time is not None and
-                end_time < self._data_source.data_source_meta.start_time) or \
-           (start_time is not None and
-                start_time > self._data_source.data_source_meta.end_time):
-            raise ValueError("time frame is out of range")
         partition_num = self._data_source.data_source_meta.partition_num
         data_block_fnames = {}
         for partition_id in range(0, partition_num):
@@ -135,9 +130,9 @@ class DataBlockVisitor(object):
                 reason = ''
                 if rep is None:
                     reason = 'failed to create data block rep'
-                elif end_time is not None and rep.start_time > end_time:
+                elif end_time is not None and rep.end_time > end_time:
                     reason = 'excess time frame'
-                elif start_time is not None and rep.end_time < start_time:
+                elif start_time is not None and rep.end_time <= start_time:
                     reason = 'less time frame'
                 elif self._filter_by_visible(rep.data_block_index, manifest):
                     reason = 'data block visible'
@@ -165,6 +160,11 @@ class DataBlockVisitor(object):
             return DataBlockRep(self._data_source_name(),
                                 fname, partition_id, dirpath)
         return None
+
+    def LoadDataBlockRepByBlockId(self, block_id):
+        block_info = decode_block_id(block_id)
+        return self.LoadDataBlockReqByIndex(
+            block_info['partition_id'], block_info['data_block_index'])
 
     def _list_data_block(self, partition_id):
         dirpath = self._partition_data_block_dir(partition_id)

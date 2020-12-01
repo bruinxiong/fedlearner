@@ -5,10 +5,15 @@ module.exports = {
     let transaction = await queryInterface.sequelize.transaction();
     try {
       let schema = await queryInterface.showAllSchemas();
+      console.log('DB schema:', schema);
+
       let tables = [];
-      schema.forEach(x => {tables.push(x.Tables_in_fedlearner)});
+      schema.forEach(x => { for (var key in x) tables.push(x[key]) });
+
+      console.log("Existing tables:", tables);
 
       if (!tables.includes('federations')) {
+        console.log("Creating federations table...");
         await queryInterface.createTable(
           'federations',
           {
@@ -72,6 +77,7 @@ module.exports = {
       }
 
       if (!tables.includes('jobs')) {
+        console.log("Creating jobs table...");
         await queryInterface.createTable(
           'jobs',
           {
@@ -139,6 +145,7 @@ module.exports = {
       }
 
       if (!tables.includes('raw_datas')) {
+        console.log("Creating raw_datas table...");
         await queryInterface.createTable(
           'raw_datas',
           {
@@ -221,6 +228,7 @@ module.exports = {
       }
 
       if (!tables.includes('tickets')) {
+        console.log("Creating tickets table...");
         await queryInterface.createTable(
           'tickets',
           {
@@ -304,6 +312,7 @@ module.exports = {
       }
 
       if (!tables.includes('users')) {
+        console.log("Creating users table...");
         await queryInterface.createTable(
           'users',
           {
@@ -371,6 +380,7 @@ module.exports = {
           {}
         );
 
+        console.log("Inserting seed user...");
         await queryInterface.bulkInsert('users', [{
           username: 'ada',
           password: 'fdee430d40bd57de',
@@ -384,6 +394,7 @@ module.exports = {
       await transaction.commit();
       return Promise.resolve();
     } catch (err) {
+      console.log("Exception: ", err);
       if (transaction) {
         await transaction.rollback();
       }
@@ -402,6 +413,7 @@ module.exports = {
       await transaction.commit();
       return Promise.resolve();
     } catch (err) {
+      console.log("Exception: ", err);
       if (transaction) {
         await transaction.rollback();
       }

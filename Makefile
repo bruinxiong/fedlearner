@@ -4,7 +4,7 @@ else
 	include config.mk.template
 endif
 
-.PHONY: protobuf lint test unit-test integration-test test
+.PHONY: protobuf lint test unit-test integration-test test webconsole2-test
 
 ci:
 	bash ci/ci_test.sh
@@ -17,9 +17,11 @@ protobuf:
 		--python_out=. \
 		--grpc_python_out=. \
 		protocols/fedlearner/common/*.proto
+	cd web_console_v2/api; make protobuf
 
 lint:
 	pylint --rcfile ci/pylintrc fedlearner example
+	cd web_console_v2/api; make lint
 
 UNIT_TEST_SCRIPTS := $(shell find test -type f -name "test_*.py")
 UNIT_TESTS := $(UNIT_TEST_SCRIPTS:%.py=%.phony)
@@ -32,7 +34,10 @@ unit-test: $(UNIT_TESTS)
 integration-test:
 	bash integration_tests.sh
 
-test: unit-test integration-test
+webconsole2-test:
+	cd web_console_v2/api; make test
+
+test: webconsole2-test unit-test integration-test
 
 docker-build:
 	docker build . -t ${IMG}
